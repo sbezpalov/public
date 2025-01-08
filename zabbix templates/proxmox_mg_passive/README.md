@@ -9,6 +9,5 @@ Add the following to /etc/zabbix/zabbix_agentd.conf:
  UserParameter=pmg.disk.usage,df / | tail -1 | awk '{print $5}' | sed 's/%//'
 ```
 Last info you can find here: https://blog.bezpalov.com/archives/943
-
 Спасибо за использование шаблона.
 Если у вас есть предложения или улучшения, вы можете внести свой вклад, создав pull request или открыв issue.
