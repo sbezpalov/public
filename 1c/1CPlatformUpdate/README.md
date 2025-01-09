@@ -93,3 +93,9 @@ Run the script to install or update the platform:
 ## License
 This script is distributed under the GPLv3 License.
 
+## Contacts
+
+    Author: Sergey Bezpalov
+    Email: sergey@bezpalov.com
+
+Thank you for using this template! If you have any questions, create an Issue in the repository.
