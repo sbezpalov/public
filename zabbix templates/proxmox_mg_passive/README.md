@@ -41,12 +41,13 @@ Zabbix Template: Proxmox MG Passive
 
 Структура репозитория
 
+````
 zabbix-templates/
 ├─ Proxmox_MG_Passive/
 │   └─ zbx_template.yml    # Последняя версия YAML-шаблона
 │   └─ README.md           # Документация
 └─ ...
-
+````
     Proxmox_MG_Passive — папка, в которой хранится сам шаблон zbx_template.yml.
     README.md — данный файл с инструкциями.
 
