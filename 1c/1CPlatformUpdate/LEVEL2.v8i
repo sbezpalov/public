@@ -1,0 +1,17 @@
+﻿[Бухгалтерия Next]
+Connect=Srvr="v8app-02";Ref="ACCv2";
+External=0
+ClientConnectionSpeed=Normal
+App=Auto
+WA=1
+Version=8.3
+DefaultApp=ThickClient
+
+[УПП Next]
+Connect=Srvr="v8app-02";Ref="UPPv2";
+External=0
+ClientConnectionSpeed=Normal
+App=Auto
+WA=1
+Version=8.3
+DefaultApp=ThickClient
