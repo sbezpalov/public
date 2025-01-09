@@ -1,4 +1,4 @@
-# Zabbix Template: Proxmox MG Passive
+# Zabbix Template: Proxmox Mail Gateway
 
 Данный репозиторий содержит Zabbix-шаблон для пассивного мониторинга Proxmox Mail Gateway (PMG) версии 8.1 и выше. Шаблон собирает метрики по очереди писем, статусу службы Postfix, ресурсам (CPU, память, диск), а также содержит преднастроенные триггеры и графы.
 

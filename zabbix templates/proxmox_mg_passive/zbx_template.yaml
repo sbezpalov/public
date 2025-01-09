@@ -6,8 +6,8 @@ zabbix_export:
 
   templates:
     - uuid: c5bc5ba31c7b4c87870c64929382a5e5
-      template: 'Proxmox MG Passive'
-      name: 'Proxmox MG Passive'
+      template: 'Proxmox Mail Gateway'
+      name: 'Proxmox Mail Gateway'
       description: |
         Passive monitoring of Proxmox Mail Gateway 8.1.
         
@@ -22,6 +22,10 @@ zabbix_export:
       groups:
         - name: Templates/Applications
 
+      macros:
+        - macro: '{$QUEUE_CRIT_LENGTH}'
+          value: '10'
+
       items:
         - uuid: e938cd5350e342b193eb4972dcfa9c6f
           name: 'Postfix Queue length'
@@ -34,7 +38,7 @@ zabbix_export:
               value: mail
           triggers:
             - uuid: 70bce916ae21408196aff539fa9d81e9
-              expression: 'avg(/Proxmox MG Passive/mail.queuesize,#5)>{$QUEUE_CRIT_LENGTH}'
+              expression: 'avg(/Proxmox Mail Gateway/mail.queuesize,#5)>{$QUEUE_CRIT_LENGTH}'
               name: 'Mail queue size too high'
               priority: AVERAGE
 
@@ -48,7 +52,7 @@ zabbix_export:
               value: service
           triggers:
             - uuid: d195ee2822f54a08b3c2f64fd915eb42
-              expression: '{Proxmox MG Passive:postfix.status.last()}=0'
+              expression: '{Proxmox Mail Gateway:postfix.status.last()}=0'
               name: 'Postfix service is down'
               priority: HIGH
 
@@ -64,7 +68,7 @@ zabbix_export:
               value: cpu
           triggers:
             - uuid: 78b0ea6a2b2c4b5fb964b7189089e774
-              expression: '{Proxmox MG Passive:pmg.cpu.usage.last()}>90'
+              expression: '{Proxmox Mail Gateway:pmg.cpu.usage.last()}>90'
               name: 'High CPU usage on PMG'
               priority: WARNING
 
@@ -80,7 +84,7 @@ zabbix_export:
               value: memory
           triggers:
             - uuid: 91bd2b62a9a3422a8d4dd8fd32f45a86
-              expression: '{Proxmox MG Passive:pmg.mem.usage.last()}>80'
+              expression: '{Proxmox Mail Gateway:pmg.mem.usage.last()}>80'
               name: 'High memory usage on PMG'
               priority: WARNING
 
@@ -96,16 +100,13 @@ zabbix_export:
               value: disk
           triggers:
             - uuid: c9c44d36bebe49998cec90fbb7223e14
-              expression: '{Proxmox MG Passive:pmg.disk.usage.last()}>90'
+              expression: '{Proxmox Mail Gateway:pmg.disk.usage.last()}>90'
               name: 'Disk usage critical on PMG'
               priority: HIGH
 
       tags:
         - tag: app
           value: mail
-      macros:
-        - macro: '{$QUEUE_CRIT_LENGTH}'
-          value: '10'
 
   graphs:
     - uuid: 8dfb6cd7993040298a2846b3fb3b8f53
@@ -114,7 +115,7 @@ zabbix_export:
         - color: 1A7C11
           calc_fnc: ALL
           item:
-            host: 'Proxmox MG Passive'
+            host: 'Proxmox Mail Gateway'
             key: mail.queuesize
 
     - uuid: 220864fe96e24c2dbfca477e19e4d0e4
@@ -123,15 +124,15 @@ zabbix_export:
         - color: FF0000
           calc_fnc: AVG
           item:
-            host: 'Proxmox MG Passive'
+            host: 'Proxmox Mail Gateway'
             key: pmg.cpu.usage
         - color: 0000FF
           calc_fnc: AVG
           item:
-            host: 'Proxmox MG Passive'
+            host: 'Proxmox Mail Gateway'
             key: pmg.mem.usage
         - color: 00FF00
           calc_fnc: AVG
           item:
-            host: 'Proxmox MG Passive'
+            host: 'Proxmox Mail Gateway'
             key: pmg.disk.usage
