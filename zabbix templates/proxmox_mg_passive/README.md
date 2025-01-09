@@ -114,6 +114,5 @@ systemctl restart zabbix-agent
 
     Автор: Sergey Bezpalov
     Email: sergey@bezpalov.com
-    Telegram: @sbezpalov
 
 Спасибо за использование данного шаблона! Если возникнут вопросы — создавайте Issue в репозитории.
