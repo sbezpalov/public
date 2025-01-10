@@ -1,4 +1,3 @@
 # 1CBulkUpdate.ps1
 
-Remote bulk update platform on servers
-Draft
+Remote bulk update 1C platform on servers /Draft/
