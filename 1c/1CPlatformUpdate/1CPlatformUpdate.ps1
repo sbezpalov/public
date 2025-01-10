@@ -1,5 +1,5 @@
-﻿# 1C Platform Update v.1.0, could be used with Group Policy
-# ( with comcntr.dll registration and hasp.ini distribution )
+# 1C Platform Update v.1.0, could be used with Group Policy
+# with comcntr.dll registration and hasp.ini distribution
 
 # Path to the configuration file
 $configFilePath = "\\Servers\Scripts\PlatformInstall.ini"
@@ -124,6 +124,20 @@ function Register-ComCntrDll {
     }
 }
 
+# Function to validate required fields in configuration
+function Validate-RequiredFields {
+    param (
+        [hashtable]$Config,
+        [array]$RequiredFields
+    )
+
+    foreach ($field in $RequiredFields) {
+        if (-Not $Config.ContainsKey($field)) {
+            Catch-Error -ErrorMessage "Missing required field `$field in configuration file."
+        }
+    }
+}
+
 # Read configuration file
 if (-Not (Test-Path -Path $configFilePath)) {
     Catch-Error -ErrorMessage "Configuration file not found at $configFilePath."
@@ -134,11 +148,7 @@ $installConfig = $config['INSTALL']
 
 # Validate required configuration fields
 $requiredFields = @("DistrDir", "ProductCode", "ProductVersion", "MsiPackage", "MsiOptions", "HaspIni")
-foreach ($field in $requiredFields) {
-    if (-Not $installConfig.ContainsKey($field)) {
-        Catch-Error -ErrorMessage "Missing required field `$field in configuration file."
-    }
-}
+Validate-RequiredFields -Config $installConfig -RequiredFields $requiredFields
 
 # Check installed version
 $installedVersion = Get-InstalledVersion
