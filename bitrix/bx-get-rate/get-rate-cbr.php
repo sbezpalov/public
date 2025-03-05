@@ -5,7 +5,7 @@ function GetRateFromCBR($CURRENCY)
     global $APPLICATION;
 
     if (!preg_match('/^[A-Z]{3}$/', $CURRENCY)) {
-        // Invalid currency code format
+        // Ошибка формата кода валюты
         return false;
     }
 
@@ -18,7 +18,7 @@ function GetRateFromCBR($CURRENCY)
     $DATE_RATE = date("d.m.Y"); // Сегодня
     $QUERY_STR = "date_req=" . $DB->FormatDate($DATE_RATE, CLang::GetDateFormat("SHORT", $lang), "D.M.Y");
 
-    // Делаем запрос к www.cbr.ru с просьбой отдать курс на нынешнюю дату
+    // Делаем запрос к www.cbr.ru с просьбой отдать курс на сегодня
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, "http://www.cbr.ru/scripts/XML_daily.asp?" . $QUERY_STR);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
@@ -66,7 +66,7 @@ function GetRateFromCBR($CURRENCY)
     }
 
     if (isset($NEW_RATE['RATE']) && isset($NEW_RATE['RATE_CNT'])) {
-        // Курс получили, возможно, курс на нынешнюю дату уже есть на сайте, проверяем
+        // Курс получили, возможно, курс на сегодня уже есть на сайте, проверяем
         CModule::IncludeModule('currency');
         $arFilter = array(
             "CURRENCY" => $NEW_RATE['CURRENCY'],
@@ -77,7 +77,7 @@ function GetRateFromCBR($CURRENCY)
 
         $db_rate = CCurrencyRates::GetList($by, $order, $arFilter);
         if (!$ar_rate = $db_rate->Fetch()) {
-            // Такого курса нет, создаём курс на нынешнюю дату
+            // Такого курса нет, создаём курс на сегодня
             CCurrencyRates::Add($NEW_RATE);
         }
     }
