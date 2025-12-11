@@ -1,39 +1,63 @@
 <#
 .SYNOPSIS
     Профессиональная очистка кэша 1С сервера с автоматическим определением путей из реестра
+
 .DESCRIPTION
-    Версия 3.0.0 - Минималистичная версия с поддержкой EN/RU языков
-    Автоматически находит параметры 1С из реестра Windows, поддерживает кластеры
+    Версия 3.1.0
+    - Автоматически находит параметры 1С из реестра Windows (SrvInfoPath, версия и т.п.)
+    - Поддерживает кластеры (анализ reg_1cv8)
+    - Использует settings.json для настроек (пути, логирование, безопасность)
+    - Использует локализацию en-US / ru-RU через psd1
+
 .AUTHOR
     1C Server Automation Community
+
 .VERSION
-    3.0.0
+    3.1.0
+
 .PARAMETER ServiceStopTimeout
-    Таймаут остановки служб в секундах (по умолчанию: 120)
+    Таймаут остановки служб в секундах (по умолчанию: из settings.json -> defaults.serviceStopTimeout)
+
 .PARAMETER SrvInfoPath
-    Ручное указание пути к srvinfo (если не определяется автоматически)
+    Ручное указание пути к srvinfo (если не определяется автоматически или если нужно переопределить)
+
 .PARAMETER Language
-    Язык интерфейса: en-US (по умолчанию) или ru-RU
+    Язык интерфейса: en-US или ru-RU.
+    Если параметр не указан, используется defaults.language из settings.json:
+        - "auto"  → язык текущей культуры системы
+        - "en-US"/"ru-RU" → принудительно указанный язык
+
 .PARAMETER WhatIf
-    Пробный запуск без выполнения действий
+    Пробный запуск, без реальной остановки служб и удаления файлов
+
 .PARAMETER Diagnostic
-    Режим диагностики - показывает конфигурацию без очистки
+    Диагностический режим: выводит информацию о конфигурации 1С (без очистки)
+
 .PARAMETER Force
-    Принудительный режим (игнорирует проверки безопасности)
+    Пропуск проверок безопасности (активные сессии и проверки пути)
+    ВНИМАНИЕ: использовать только осознанно
+
 .PARAMETER NoServiceRestart
-    Не перезапускать службы (только очистка кэша)
+    Не останавливать и не запускать службы 1С (очистка при работающих службах не рекомендуется)
+
 .EXAMPLE
-    .\Clear-1CServerCache.ps1 -Diagnostic
-    Показать текущую конфигурацию 1С
+    .\Clear-1CServerCache.ps1
+    Стандартная очистка с настройками из settings.json
+
 .EXAMPLE
-    .\Clear-1CServerCache.ps1 -WhatIf -Verbose
-    Пробный запуск с детальным выводом
+    .\Clear-1CServerCache.ps1 -SrvInfoPath "C:\Program Files\1cv8\srvinfo"
+    Очистка с явно указанным каталогом srvinfo
+
+.EXAMPLE
+    .\Clear-1CServerCache.ps1 -WhatIf
+    Пробный запуск без фактической очистки
+
 .EXAMPLE
     .\Clear-1CServerCache.ps1 -Language ru-RU
     Очистка с русским интерфейсом
 #>
 
-[CmdletBinding(SupportsShouldProcess=$true)]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param (
     [int]$ServiceStopTimeout = 120,
     [string]$SrvInfoPath,
@@ -46,50 +70,124 @@ param (
 )
 
 # ============================================
-# РЕГИОНАЛЬНЫЕ НАСТРОЙКИ И ЛОКАЛИЗАЦИЯ
+# ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ СКРИПТА
 # ============================================
 
-# Загрузка локализации
+# Конфигурация из settings.json
+$Script:Config = $null
+# Локализация (Messages/Prompts/ServiceNames)
+$Script:Localization = $null
+# Эффективный язык (en-US/ru-RU)
+$Script:LanguageEffective = "en-US"
+
+# ============================================
+# ЛОКАЛИЗАЦИЯ
+# ============================================
+
 function Get-1CLocalization {
-    param([string]$Language)
-    
+    param(
+        [string]$Language
+    )
+
     $LocalizationPath = Join-Path $PSScriptRoot "Localization"
     $LocalizationFile = Join-Path $LocalizationPath "$Language.psd1"
-    
+
     if (Test-Path $LocalizationFile) {
         return Import-LocalizedData -BaseDirectory $LocalizationPath -FileName "$Language.psd1"
     } else {
+        # Фолбэк на en-US
         return Import-LocalizedData -BaseDirectory $LocalizationPath -FileName "en-US.psd1"
     }
 }
 
-# Определяем язык по умолчанию
-if (-not $Language) {
-    $Language = (Get-Culture).Name
-    if ($Language -notin @("en-US", "ru-RU")) { $Language = "en-US" }
+# ============================================
+# ЗАГРУЗКА НАСТРОЕК И ИНИЦИАЛИЗАЦИЯ
+# ============================================
+
+function Load-1CSettings {
+    $ConfigPath = Join-Path $PSScriptRoot "settings.json"
+
+    if (Test-Path $ConfigPath) {
+        try {
+            $json = Get-Content $ConfigPath -Raw -Encoding UTF8
+            $Script:Config = $json | ConvertFrom-Json
+        } catch {
+            throw "Не удалось прочитать settings.json: $($_.Exception.Message)"
+        }
+    } else {
+        # Базовые дефолты, если settings.json отсутствует
+        $Script:Config = [PSCustomObject]@{
+            version  = "3.1.0"
+            author   = "1C Server Automation Community"
+            defaults = [PSCustomObject]@{
+                serviceStopTimeout = 120
+                language           = "auto"
+                logRetentionDays   = 30
+            }
+            paths    = [PSCustomObject]@{
+                defaultSrvInfo = "C:\Program Files\1cv8\srvinfo"
+                logDirectory   = "C:\Scripts\Logs\1C_Maintenance"
+            }
+            safety   = [PSCustomObject]@{
+                checkActiveSessions = $true
+                requireConfirmation = $false
+                enableBackup        = $false
+            }
+            serviceNames = $null
+            logging      = [PSCustomObject]@{
+                level          = "INFO"
+                maxFileSizeMB  = 10
+                enableEventLog = $true
+            }
+        }
+    }
+
+    # Определение языка
+    if ($PSBoundParameters.ContainsKey('Language') -and $Language) {
+        $Script:LanguageEffective = $Language
+    } else {
+        $defaultLang = $Script:Config.defaults.language
+        if ([string]::IsNullOrWhiteSpace($defaultLang) -or $defaultLang -eq "auto") {
+            $Script:LanguageEffective = (Get-Culture).Name
+        } else {
+            $Script:LanguageEffective = $defaultLang
+        }
+    }
+
+    if ($Script:LanguageEffective -notin @("en-US", "ru-RU")) {
+        $Script:LanguageEffective = "en-US"
+    }
+
+    $Script:Localization = Get-1CLocalization -Language $Script:LanguageEffective
 }
 
-$Localization = Get-1CLocalization -Language $Language
+function Test-Admin {
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        throw "Скрипт должен быть запущен от имени администратора."
+    }
+}
 
 # ============================================
-# ЧТЕНИЕ РЕЕСТРА WINDOWS
+# РАБОТА С РЕЕСТРОМ / КОНФИГУРАЦИЕЙ 1С
 # ============================================
 
 function Get-1CAgentServiceInfo {
-    # Поиск службы агента 1С в реестре
+    # Поиск службы агента 1С в системных службах
     $AgentPatterns = @(
         "1C:Enterprise 8.3 Server Agent*",
         "Агент сервера 1С:Предприятие*",
         "1C:Enterprise 8.3 Server Agent (x86-64)*",
         "1C:Enterprise 8.2 Server Agent*"
     )
-    
+
     foreach ($Pattern in $AgentPatterns) {
         $Services = Get-Service -DisplayName $Pattern -ErrorAction SilentlyContinue
         if ($Services) {
             $Service = $Services[0]
             $RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($Service.Name)"
-            
+
             if (Test-Path $RegPath) {
                 $RegProperties = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
                 if ($RegProperties -and $RegProperties.ImagePath) {
@@ -98,7 +196,7 @@ function Get-1CAgentServiceInfo {
                     if ($RegProperties.ImagePath -match 'ragent\.exe\s+(.*)$') {
                         $ArgsString = $Matches[1]
                         $Tokens = $ArgsString -split '\s+' | Where-Object { $_ }
-                        
+
                         for ($i = 0; $i -lt $Tokens.Count; $i++) {
                             if ($Tokens[$i] -match '^-(\w+)$') {
                                 $ParamName = $Matches[1]
@@ -111,33 +209,42 @@ function Get-1CAgentServiceInfo {
                             }
                         }
                     }
-                    
-                    # Извлечение информации
-                    $SrvInfoPath = if ($Parameters.d) { $Parameters.d } else { $null }
-                    $Version = if ($RegProperties.ImagePath -match '1cv8\\([\d\.]+)\\bin') { $Matches[1] } else { $null }
-                    
+
+                    $SrvInfoPath = $null
+                    if ($Parameters.ContainsKey('d')) {
+                        $SrvInfoPath = $Parameters['d']
+                    }
+
+                    # Определение версии из каталога ragent.exe
+                    $Version = $null
+                    if ($RegProperties.ImagePath -match '([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)') {
+                        $Version = $Matches[1]
+                    }
+
                     return [PSCustomObject]@{
                         ServiceName = $Service.Name
                         DisplayName = $Service.DisplayName
-                        ImagePath = $RegProperties.ImagePath
-                        Parameters = $Parameters
+                        ImagePath   = $RegProperties.ImagePath
+                        Parameters  = $Parameters
                         SrvInfoPath = $SrvInfoPath
-                        Version = $Version
+                        Version     = $Version
                     }
                 }
             }
         }
     }
-    
+
     return $null
 }
 
 function Get-1CClusterNodes {
-    param([string]$SrvInfoPath)
-    
+    param(
+        [string]$SrvInfoPath
+    )
+
     $Nodes = @()
     $ClusterRegPath = Join-Path $SrvInfoPath "reg_1cv8"
-    
+
     if (Test-Path $ClusterRegPath) {
         $RegFiles = Get-ChildItem -Path $ClusterRegPath -Filter "*.reg" -ErrorAction SilentlyContinue
         foreach ($RegFile in $RegFiles) {
@@ -145,7 +252,7 @@ function Get-1CClusterNodes {
             if ($Content -match '"AgentHost"="([^"]+)"') {
                 $NodeInfo = @{
                     NodeName = $Matches[1]
-                    RegFile = $RegFile.FullName
+                    RegFile  = $RegFile.FullName
                 }
                 if ($Content -match '"AgentPort"="(\d+)"') {
                     $NodeInfo.AgentPort = [int]$Matches[1]
@@ -154,18 +261,32 @@ function Get-1CClusterNodes {
             }
         }
     }
-    
+
     return $Nodes
 }
 
 function Get-1CFullConfiguration {
     $AgentService = Get-1CAgentServiceInfo
+
+    $SrvInfoPath = if ($AgentService -and $AgentService.SrvInfoPath) {
+        $AgentService.SrvInfoPath
+    } elseif ($Script:Config -and $Script:Config.paths.defaultSrvInfo) {
+        $Script:Config.paths.defaultSrvInfo
+    } else {
+        $null
+    }
+
+    $ClusterNodes = @()
+    if ($SrvInfoPath) {
+        $ClusterNodes = Get-1CClusterNodes -SrvInfoPath $SrvInfoPath
+    }
+
     $Config = @{
         AgentService = $AgentService
-        SrvInfoPath = if ($AgentService -and $AgentService.SrvInfoPath) { $AgentService.SrvInfoPath } else { $null }
-        ClusterNodes = if ($AgentService -and $AgentService.SrvInfoPath) { Get-1CClusterNodes -SrvInfoPath $AgentService.SrvInfoPath } else { @() }
+        SrvInfoPath  = $SrvInfoPath
+        ClusterNodes = $ClusterNodes
     }
-    
+
     return [PSCustomObject]$Config
 }
 
@@ -174,51 +295,178 @@ function Get-1CFullConfiguration {
 # ============================================
 
 function Initialize-Logging {
+    param(
+        [object]$Config
+    )
+
+    $LogDir = if ($Config -and $Config.paths -and $Config.paths.logDirectory) {
+        $Config.paths.logDirectory
+    } else {
+        "C:\Scripts\Logs\1C_Maintenance"
+    }
+
+    if (-not (Test-Path $LogDir)) {
+        New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+    }
+
+    # Ротация логов
+    $RetentionDays = 0
+    if ($Config -and $Config.defaults -and $Config.defaults.logRetentionDays) {
+        $RetentionDays = [int]$Config.defaults.logRetentionDays
+    }
+
+    if ($RetentionDays -gt 0) {
+        $Threshold = (Get-Date).AddDays(-$RetentionDays)
+        Get-ChildItem -Path $LogDir -Filter "1CCacheCleaner_*.log" -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -lt $Threshold } |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
     $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $LogDir = "C:\Scripts\Logs\1C_Maintenance"
-    if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
-    
-    $LogFile = Join-Path $LogDir "1CCacheCleaner_$Timestamp.log"
+    $LogFile   = Join-Path $LogDir "1CCacheCleaner_$Timestamp.log"
     return $LogFile
 }
 
 function Write-Log {
-    param([string]$Message, [string]$Level = "INFO", [string]$LogFile)
-    
+    param(
+        [string]$Message,
+        [ValidateSet("DEBUG", "INFO", "WARNING", "ERROR", "SUCCESS")]
+        [string]$Level = "INFO",
+        [string]$LogFile
+    )
+
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $Formatted = "[$Timestamp] [$Level] $Message"
-    
+
+    # Определение минимального уровня логирования
+    $minLevel = "INFO"
+    if ($Script:Config -and $Script:Config.logging -and $Script:Config.logging.level) {
+        $minLevel = $Script:Config.logging.level.ToUpper()
+    }
+
+    $Order = @{
+        "DEBUG"   = 0
+        "INFO"    = 1
+        "SUCCESS" = 1
+        "WARNING" = 2
+        "ERROR"   = 3
+    }
+
+    $levelKey = $Level.ToUpper()
+    if (-not $Order.ContainsKey($levelKey)) {
+        $levelKey = "INFO"
+    }
+
+    $minKey = if ($Order.ContainsKey($minLevel)) { $minLevel } else { "INFO" }
+
+    if ($Order[$levelKey] -lt $Order[$minKey]) {
+        return
+    }
+
     # Консоль
-    $Colors = @{INFO="White"; WARNING="Yellow"; ERROR="Red"; SUCCESS="Green"}
-    Write-Host $Formatted -ForegroundColor $Colors[$Level]
-    
+    $Colors = @{
+        DEBUG   = "DarkGray"
+        INFO    = "White"
+        WARNING = "Yellow"
+        ERROR   = "Red"
+        SUCCESS = "Green"
+    }
+
+    $color = if ($Colors.ContainsKey($levelKey)) { $Colors[$levelKey] } else { "White" }
+    Write-Host $Formatted -ForegroundColor $color
+
     # Файл
-    $Formatted | Out-File -FilePath $LogFile -Append -Encoding UTF8
-    
-    # Event Log (только для важных событий)
-    if ($Level -in @("ERROR", "WARNING")) {
+    if ($LogFile) {
+        $Formatted | Out-File -FilePath $LogFile -Append -Encoding UTF8
+    }
+
+    # Event Log (только для WARNING/ERROR и только если включено в настройках)
+    if ($Script:Config -and $Script:Config.logging.enableEventLog -and $levelKey -in @("ERROR", "WARNING")) {
         try {
-            if (-not [System.Diagnostics.EventLog]::SourceExists("1C Cache Cleaner")) {
-                [System.Diagnostics.EventLog]::CreateEventSource("1C Cache Cleaner", "Application")
+            $sourceName = "1C Cache Cleaner"
+            if (-not [System.Diagnostics.EventLog]::SourceExists($sourceName)) {
+                [System.Diagnostics.EventLog]::CreateEventSource($sourceName, "Application")
             }
-            $EventId = switch ($Level) { "ERROR" { 1001 }; "WARNING" { 1002 }; default { 1000 } }
-            Write-EventLog -LogName "Application" -Source "1C Cache Cleaner" -EventId $EventId -EntryType $Level -Message $Message
-        } catch { }
+            $EventId = switch ($levelKey) {
+                "ERROR"   { 1001 }
+                "WARNING" { 1002 }
+                default   { 1000 }
+            }
+            Write-EventLog -LogName "Application" -Source $sourceName -EventId $EventId -EntryType $levelKey -Message $Message
+        } catch {
+            # Ошибки логирования в EventLog не должны ломать основной сценарий
+        }
     }
 }
 
 # ============================================
-# БЕЗОПАСНОСТЬ И ПРОВЕРКИ
+# БЕЗОПАСНОСТЬ
 # ============================================
 
 function Test-Safety {
-    # Проверка активных сессий 1С
-    $1CProcesses = Get-Process -Name "1cv8", "1cv8c", "1cv8s" -ErrorAction SilentlyContinue
-    if ($1CProcesses) {
-        Write-Host "НАЙДЕНЫ АКТИВНЫЕ СЕССИИ 1С!" -ForegroundColor Red -BackgroundColor Black
-        $1CProcesses | ForEach-Object { Write-Host "  - $($_.ProcessName) (PID: $($_.Id))" -ForegroundColor Red }
-        return $false
+    param(
+        [switch]$Force,
+        [string]$LogFile
+    )
+
+    if ($Force) {
+        if ($LogFile) {
+            Write-Log -Message "Параметр -Force указан: проверки безопасности пропущены" -Level "WARNING" -LogFile $LogFile
+        }
+        return $true
     }
+
+    if ($Script:Config -and $Script:Config.safety -and -not $Script:Config.safety.checkActiveSessions) {
+        if ($LogFile) {
+            Write-Log -Message "Проверка активных сессий 1С отключена в settings.json" -Level "WARNING" -LogFile $LogFile
+        }
+        return $true
+    }
+
+    # Проверка активных процессов 1С
+    $Processes1C = Get-Process -Name "1cv8", "1cv8c", "1cv8s" -ErrorAction SilentlyContinue
+    if ($Processes1C) {
+        $warningText = if ($Script:Localization -and $Script:Localization.Prompts.WarningActiveSessions) {
+            $Script:Localization.Prompts.WarningActiveSessions
+        } else {
+            "ВНИМАНИЕ: Найдены активные процессы 1С"
+        }
+
+        Write-Host $warningText -ForegroundColor Red -BackgroundColor Black
+        $Processes1C | ForEach-Object {
+            Write-Host ("  - {0} (PID: {1})" -f $_.ProcessName, $_.Id) -ForegroundColor Red
+        }
+
+        if ($LogFile) {
+            Write-Log -Message "Обнаружены активные процессы 1С, очистка потенциально опасна" -Level "ERROR" -LogFile $LogFile
+        }
+
+        if ($Script:Config.safety.requireConfirmation) {
+            $prompt = if ($Script:Localization -and $Script:Localization.Prompts.ConfirmCleanup) {
+                $Script:Localization.Prompts.ConfirmCleanup
+            } else {
+                "Proceed with cache cleanup? [Y/N]: "
+            }
+
+            $answer = Read-Host $prompt
+            if ($answer -notin @("Y", "y", "Yes", "YES", "Д", "д", "Да", "ДА")) {
+                if ($LogFile) {
+                    Write-Log -Message "Очистка кэша отменена пользователем из-за активных сессий" -Level "WARNING" -LogFile $LogFile
+                }
+                return $false
+            }
+
+            return $true
+        } else {
+            # Требуем явного применения -Force, если confirmation отключен
+            return $false
+        }
+    }
+
+    if ($LogFile -and $Script:Localization -and $Script:Localization.Messages.SafetyCheckPassed) {
+        Write-Log -Message $Script:Localization.Messages.SafetyCheckPassed -Level "INFO" -LogFile $LogFile
+    }
+
     return $true
 }
 
@@ -227,28 +475,34 @@ function Test-Safety {
 # ============================================
 
 function Stop-1CServices {
-    param([string[]]$ServiceNames, [int]$Timeout, [string]$LogFile, [switch]$WhatIf)
-    
+    param(
+        [string[]]$ServiceNames,
+        [int]$Timeout,
+        [string]$LogFile,
+        [switch]$WhatIf
+    )
+
     $Stopped = @()
+
     foreach ($ServiceName in $ServiceNames) {
         $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if (-not $Service) { 
+        if (-not $Service) {
             Write-Log -Message "Служба не найдена: $ServiceName" -Level "WARNING" -LogFile $LogFile
-            continue 
+            continue
         }
-        
+
         if ($Service.Status -eq 'Stopped') {
             Write-Log -Message "Служба уже остановлена: $ServiceName" -Level "INFO" -LogFile $LogFile
             $Stopped += $ServiceName
             continue
         }
-        
+
         if ($WhatIf) {
             Write-Log -Message "[WhatIf] Остановка службы: $ServiceName" -Level "INFO" -LogFile $LogFile
             $Stopped += $ServiceName
             continue
         }
-        
+
         try {
             Write-Log -Message "Останавливаем службу: $ServiceName" -Level "INFO" -LogFile $LogFile
             Stop-Service -Name $ServiceName -Force
@@ -260,20 +514,24 @@ function Stop-1CServices {
             throw
         }
     }
-    
+
     Start-Sleep -Seconds 3
     return $Stopped
 }
 
 function Start-1CServices {
-    param([string[]]$ServiceNames, [string]$LogFile, [switch]$WhatIf)
-    
+    param(
+        [string[]]$ServiceNames,
+        [string]$LogFile,
+        [switch]$WhatIf
+    )
+
     foreach ($ServiceName in $ServiceNames) {
         if ($WhatIf) {
             Write-Log -Message "[WhatIf] Запуск службы: $ServiceName" -Level "INFO" -LogFile $LogFile
             continue
         }
-        
+
         try {
             Write-Log -Message "Запускаем службу: $ServiceName" -Level "INFO" -LogFile $LogFile
             Start-Service -Name $ServiceName
@@ -292,52 +550,51 @@ function Start-1CServices {
 # ============================================
 
 function Clear-1CCache {
-    param([string]$SrvInfoPath, [string]$LogFile, [switch]$WhatIf)
-    
+    param(
+        [string]$SrvInfoPath,
+        [string]$LogFile,
+        [switch]$WhatIf
+    )
+
     Write-Log -Message "Начинаем очистку кэша: $SrvInfoPath" -Level "INFO" -LogFile $LogFile
-    
-    # Проверка пути
+
     if (-not (Test-Path $SrvInfoPath)) {
         Write-Log -Message "Путь не найден: $SrvInfoPath" -Level "ERROR" -LogFile $LogFile
-        throw "Path not found"
+        throw "Path not found: $SrvInfoPath"
     }
-    
-    # Поиск директорий кэша
+
+    # Поиск директорий кэша snccntx*
     $CacheDirs = Get-ChildItem -Path $SrvInfoPath -Directory -Filter "snccntx*" -Recurse -ErrorAction SilentlyContinue
-    
+
     if (-not $CacheDirs) {
-        Write-Log -Message "Директории кэша не найдены" -Level "WARNING" -LogFile $LogFile
+        Write-Log -Message "Директории кэша не найдены под $SrvInfoPath" -Level "WARNING" -LogFile $LogFile
         return
     }
-    
-    Write-Log -Message "Найдено директорий кэша: $($CacheDirs.Count)" -Level "INFO" -LogFile $LogFile
+
+    $TotalDirs  = 0
     $TotalFiles = 0
-    $TotalDirs = 0
-    
+
     foreach ($Dir in $CacheDirs) {
-        if ($WhatIf) {
-            $Files = Get-ChildItem -Path $Dir.FullName -File -ErrorAction SilentlyContinue
-            $FileCount = if ($Files) { $Files.Count } else { 0 }
-            Write-Log -Message "[WhatIf] Будет очищено: $($Dir.FullName) ($FileCount файлов)" -Level "INFO" -LogFile $LogFile
-            continue
-        }
-        
         try {
-            $Files = Get-ChildItem -Path $Dir.FullName -File -ErrorAction SilentlyContinue
-            $FileCount = if ($Files) { $Files.Count } else { 0 }
-            
-            if ($FileCount -gt 0) {
-                $Files | Remove-Item -Force
-                Write-Log -Message "Очищено: $($Dir.Name) ($FileCount файлов)" -Level "INFO" -LogFile $LogFile
-                $TotalFiles += $FileCount
+            $Files = Get-ChildItem -Path $Dir.FullName -File -Recurse -ErrorAction SilentlyContinue
+            $FileCount = $Files.Count
+
+            if ($WhatIf) {
+                Write-Log -Message "[WhatIf] Нашли кэш: $($Dir.FullName) ($FileCount файлов)" -Level "INFO" -LogFile $LogFile
+            } else {
+                if ($FileCount -gt 0) {
+                    $Files | Remove-Item -Force -ErrorAction SilentlyContinue
+                    Write-Log -Message "Очищено: $($Dir.FullName) ($FileCount файлов)" -Level "INFO" -LogFile $LogFile
+                    $TotalFiles += $FileCount
+                }
             }
-            
+
             $TotalDirs++
         } catch {
             Write-Log -Message "Ошибка очистки $($Dir.FullName): $($_.Exception.Message)" -Level "ERROR" -LogFile $LogFile
         }
     }
-    
+
     Write-Log -Message "Очистка завершена: $TotalDirs директорий, $TotalFiles файлов" -Level "SUCCESS" -LogFile $LogFile
 }
 
@@ -347,157 +604,209 @@ function Clear-1CCache {
 
 function Show-Diagnostics {
     $Config = Get-1CFullConfiguration
-    
+
     Write-Host "=== ДИАГНОСТИКА 1С СЕРВЕРА ===" -ForegroundColor Cyan
     Write-Host ""
-    
+
     if ($Config.AgentService) {
         Write-Host "СЛУЖБА АГЕНТА:" -ForegroundColor Green
-        Write-Host "  Имя: $($Config.AgentService.DisplayName)" -ForegroundColor Yellow
-        Write-Host "  Версия: $($Config.AgentService.Version)" -ForegroundColor Gray
-        Write-Host "  Путь srvinfo: $(if ($Config.AgentService.SrvInfoPath) { $Config.AgentService.SrvInfoPath } else { 'Не найден' })" -ForegroundColor $(if ($Config.AgentService.SrvInfoPath) { "Green" } else { "Red" })
-        
+        Write-Host ("  Имя: {0}" -f $Config.AgentService.DisplayName) -ForegroundColor Yellow
+        Write-Host ("  Версия: {0}" -f $Config.AgentService.Version) -ForegroundColor Gray
+        $srvInfo = if ($Config.AgentService.SrvInfoPath) { $Config.AgentService.SrvInfoPath } else { "<не определён>" }
+        Write-Host ("  Путь srvinfo: {0}" -f $srvInfo) -ForegroundColor (if ($Config.AgentService.SrvInfoPath) { "Green" } else { "Red" })
+
         if ($Config.AgentService.Parameters.Count -gt 0) {
             Write-Host "  Параметры:" -ForegroundColor Gray
             foreach ($key in $Config.AgentService.Parameters.Keys) {
-                Write-Host "    -$key : $($Config.AgentService.Parameters[$key])" -ForegroundColor Gray
+                Write-Host ("    -{0} : {1}" -f $key, $Config.AgentService.Parameters[$key]) -ForegroundColor Gray
             }
         }
     } else {
-        Write-Host "СЛУЖБА АГЕНТА: Не найдена!" -ForegroundColor Red
+        Write-Host "Служба агента 1С не найдена." -ForegroundColor Red
     }
-    
+
     Write-Host ""
-    Write-Host "ПУТИ:" -ForegroundColor Green
-    Write-Host "  Основной путь: $(if ($Config.SrvInfoPath) { $Config.SrvInfoPath } else { 'Не определен' })" -ForegroundColor $(if ($Config.SrvInfoPath) { "Green" } else { "Yellow" })
-    
-    if ($Config.SrvInfoPath -and (Test-Path $Config.SrvInfoPath)) {
-        $CacheDirs = Get-ChildItem -Path $Config.SrvInfoPath -Directory -Filter "snccntx*" -ErrorAction SilentlyContinue
-        Write-Host "  Директорий кэша: $($CacheDirs.Count)" -ForegroundColor $(if ($CacheDirs.Count -gt 0) { "Yellow" } else { "Gray" })
-        
-        if ($Config.ClusterNodes.Count -gt 0) {
-            Write-Host "  Режим: Кластер ($($Config.ClusterNodes.Count) узлов)" -ForegroundColor Green
+    Write-Host "КЛАСТЕРЫ:" -ForegroundColor Green
+    if ($Config.ClusterNodes.Count -gt 0) {
+        foreach ($node in $Config.ClusterNodes) {
+            Write-Host ("  Узел: {0} (порт: {1})" -f $node.NodeName, $node.AgentPort) -ForegroundColor Gray
+            Write-Host ("    Reg-файл: {0}" -f $node.RegFile) -ForegroundColor DarkGray
         }
+    } else {
+        Write-Host "  Информация о кластерах не найдена." -ForegroundColor DarkGray
     }
-    
+
     Write-Host ""
     Write-Host "БЕЗОПАСНОСТЬ:" -ForegroundColor Green
     $Safe = Test-Safety
-    Write-Host "  Активные сессии: $(if ($Safe) { 'НЕТ ✅' } else { 'ДА ⚠️' })" -ForegroundColor $(if ($Safe) { "Green" } else { "Red" })
-    
+    $statusText = if ($Safe) { "НЕТ активных процессов 1С ✅" } else { "ОБНАРУЖЕНЫ активные процессы 1С ⚠️" }
+    Write-Host ("  Активные сессии: {0}" -f $statusText) -ForegroundColor (if ($Safe) { "Green" } else { "Red" })
+
     Write-Host ""
     Write-Host "РЕКОМЕНДУЕМАЯ КОМАНДА:" -ForegroundColor Cyan
     $Cmd = ".\Clear-1CServerCache.ps1"
     if ($Config.SrvInfoPath) { $Cmd += " -SrvInfoPath `"$($Config.SrvInfoPath)`"" }
-    if ($Language -eq "ru-RU") { $Cmd += " -Language ru-RU" }
-    Write-Host "  $Cmd" -ForegroundColor Yellow
+    if ($Script:LanguageEffective -eq "ru-RU") { $Cmd += " -Language ru-RU" }
+    Write-Host ("  {0}" -f $Cmd) -ForegroundColor Yellow
 }
 
 # ============================================
-# ГЛАВНАЯ ФУНКЦИЯ
+# ОСНОВНОЙ ВХОД
 # ============================================
 
 function Main {
-    # Диагностический режим
+    # Проверка прав администратора
+    Test-Admin
+
+    # Загрузка настроек и локализации
+    Load-1CSettings
+
     if ($Diagnostic) {
         Show-Diagnostics
         return
     }
-    
-    # Инициализация
-    $LogFile = Initialize-Logging
+
+    # Инициализация логирования
+    $LogFile = Initialize-Logging -Config $Script:Config
+
+    # Стартовое сообщение
+    if ($Script:Localization -and $Script:Localization.Messages.ScriptStarted) {
+        Write-Log -Message ($Script:Localization.Messages.ScriptStarted -f $Script:Config.version) -Level "INFO" -LogFile $LogFile
+    } else {
+        Write-Log -Message "1C Server Cache Cleaner started (version $($Script:Config.version))" -Level "INFO" -LogFile $LogFile
+    }
+
+    # Чтение конфигурации 1С
     $Config = Get-1CFullConfiguration
-    
-    # Определение пути к кэшу
-    $TargetPath = if ($SrvInfoPath) { 
-        $SrvInfoPath 
-    } elseif ($Config.SrvInfoPath) { 
-        $Config.SrvInfoPath 
+
+    # Определение SrvInfoPath
+    $TargetPath = if ($SrvInfoPath) {
+        $SrvInfoPath
+    } elseif ($Config.SrvInfoPath) {
+        $Config.SrvInfoPath
+    } elseif ($Script:Config.paths.defaultSrvInfo) {
+        $Script:Config.paths.defaultSrvInfo
     } else {
-        Write-Log -Message "Путь srvinfo не найден! Укажите вручную: -SrvInfoPath 'путь'" -Level "ERROR" -LogFile $LogFile
-        throw "SrvInfo path not found"
+        $null
     }
-    
-    # Проверка пути
-    if (-not (Test-Path $TargetPath)) {
-        Write-Log -Message "Путь не существует: $TargetPath" -Level "ERROR" -LogFile $LogFile
-        throw "Path does not exist"
+
+    if (-not $TargetPath) {
+        Write-Log -Message "Не удалось определить SrvInfoPath. Укажите его параметром -SrvInfoPath или в settings.json" -Level "ERROR" -LogFile $LogFile
+        return
     }
-    
-    # Заголовок
-    Write-Host "=== ОЧИСТКА КЭША 1С СЕРВЕРА ===" -ForegroundColor Cyan
-    Write-Host "Версия: 3.0.0 | Язык: $Language" -ForegroundColor Gray
-    Write-Host "Путь: $TargetPath" -ForegroundColor Green
-    Write-Host "Режим: $(if ($WhatIf) { 'WhatIf (пробный)' } else { 'Выполнение' })" -ForegroundColor $(if ($WhatIf) { "Yellow" } else { "Green" })
-    Write-Host ""
-    
-    if ($WhatIf) {
-        Write-Host "!!! WHATIF MODE - ИЗМЕНЕНИЯ НЕ БУДУТ ВНЕСЕНЫ !!!" -ForegroundColor Red -BackgroundColor Black
-        Write-Host ""
-    }
-    
-    Write-Log -Message "Запуск очистки кэша 1С" -Level "INFO" -LogFile $LogFile
-    
-    # Проверки безопасности
-    if (-not $Force) {
-        if (-not (Test-Safety)) {
-            Write-Log -Message "Проверки безопасности не пройдены! Используйте -Force для принудительной очистки" -Level "ERROR" -LogFile $LogFile
-            throw "Safety checks failed"
+
+    # Базовая проверка пути: должны работать под каталогом, содержащим 'srvinfo'
+    if ($TargetPath -notmatch '\\srvinfo(\\|$)') {
+        Write-Log -Message "Путь SrvInfoPath выглядит нетипично: $TargetPath" -Level "WARNING" -LogFile $LogFile
+        if (-not $Force) {
+            Write-Log -Message "Для работы с нетипичным путём используйте параметр -Force" -Level "ERROR" -LogFile $LogFile
+            return
         }
-        Write-Log -Message "Проверки безопасности пройдены" -Level "SUCCESS" -LogFile $LogFile
+    }
+
+    # Итоговый таймаут остановки служб
+    $EffectiveTimeout = if ($PSBoundParameters.ContainsKey("ServiceStopTimeout")) {
+        $ServiceStopTimeout
+    } elseif ($Script:Config.defaults.serviceStopTimeout) {
+        [int]$Script:Config.defaults.serviceStopTimeout
     } else {
-        Write-Log -Message "Принудительный режим: проверки безопасности отключены" -Level "WARNING" -LogFile $LogFile
+        120
     }
-    
-    # Определение служб для остановки
+
+    # Сервисные имена (из settings.json или локализации)
+    $ServiceDisplayAgent = $null
+    $ServiceDisplayServer = $null
+
+    if ($Script:Config.serviceNames) {
+        $ServiceDisplayAgent = $Script:Config.serviceNames.agent[$Script:LanguageEffective]
+        $ServiceDisplayServer = $Script:Config.serviceNames.server[$Script:LanguageEffective]
+    }
+
+    if (-not $ServiceDisplayAgent -and $Script:Localization.ServiceNames.Agent) {
+        $ServiceDisplayAgent = $Script:Localization.ServiceNames.Agent
+    }
+    if (-not $ServiceDisplayServer -and $Script:Localization.ServiceNames.Server) {
+        $ServiceDisplayServer = $Script:Localization.ServiceNames.Server
+    }
+
     $ServicesToManage = @()
-    if (-not $NoServiceRestart) {
-        $ServicesToManage = @("1C:Enterprise 8.3 Server Agent", "1C:Enterprise 8.3 Server")
+    if ($ServiceDisplayAgent) { $ServicesToManage += $ServiceDisplayAgent }
+    if ($ServiceDisplayServer) { $ServicesToManage += $ServiceDisplayServer }
+
+    # Дополнительное подтверждение перед очисткой, если включено в настройках
+    if ($Script:Config.safety.requireConfirmation -and -not $Force) {
+        $prompt = if ($Script:Localization.Prompts.ConfirmCleanup) {
+            $Script:Localization.Prompts.ConfirmCleanup
+        } else {
+            "Proceed with cache cleanup? [Y/N]: "
+        }
+
+        $answer = Read-Host $prompt
+        if ($answer -notin @("Y", "y", "Yes", "YES", "Д", "д", "Да", "ДА")) {
+            Write-Log -Message "Очистка кэша отменена пользователем до начала операции" -Level "WARNING" -LogFile $LogFile
+            return
+        }
     }
-    
+
+    # Проверка безопасности (активные сессии и пр.)
+    if (-not (Test-Safety -Force:$Force -LogFile $LogFile)) {
+        $failMsg = if ($Script:Localization.Messages.SafetyCheckFailed) {
+            $Script:Localization.Messages.SafetyCheckFailed
+        } else {
+            "Безопасность: обнаружены активные сессии/процессы 1С"
+        }
+        Write-Log -Message $failMsg -Level "ERROR" -LogFile $LogFile
+        Write-Host ""
+        Write-Host $failMsg -ForegroundColor Red
+        return
+    }
+
     # Остановка служб
     $StoppedServices = @()
-    if ($ServicesToManage.Count -gt 0) {
+    if (-not $NoServiceRestart -and $ServicesToManage.Count -gt 0) {
         Write-Log -Message "Останавливаем службы 1С..." -Level "INFO" -LogFile $LogFile
-        $StoppedServices = Stop-1CServices -ServiceNames $ServicesToManage -Timeout $ServiceStopTimeout -LogFile $LogFile -WhatIf:$WhatIf
+        $StoppedServices = Stop-1CServices -ServiceNames $ServicesToManage -Timeout $EffectiveTimeout -LogFile $LogFile -WhatIf:$WhatIf
+    } else {
+        Write-Log -Message "Остановка служб пропущена (NoServiceRestart или не определены имена служб)" -Level "INFO" -LogFile $LogFile
     }
-    
+
     # Очистка кэша
-    try {
-        Clear-1CCache -SrvInfoPath $TargetPath -LogFile $LogFile -WhatIf:$WhatIf
-    } catch {
-        Write-Log -Message "Ошибка при очистке кэша: $($_.Exception.Message)" -Level "ERROR" -LogFile $LogFile
-        throw
-    }
-    
+    Clear-1CCache -SrvInfoPath $TargetPath -LogFile $LogFile -WhatIf:$WhatIf
+
     # Запуск служб
-    if ($StoppedServices.Count -gt 0 -and -not $NoServiceRestart) {
+    if (-not $NoServiceRestart -and $StoppedServices.Count -gt 0) {
         Write-Log -Message "Запускаем службы 1С..." -Level "INFO" -LogFile $LogFile
         Start-1CServices -ServiceNames $StoppedServices -LogFile $LogFile -WhatIf:$WhatIf
     }
-    
+
     # Завершение
-    Write-Log -Message "Очистка кэша успешно завершена" -Level "SUCCESS" -LogFile $LogFile
+    $completeMsg = if ($Script:Localization.Messages.Completion) {
+        $Script:Localization.Messages.Completion
+    } else {
+        "Очистка кэша успешно завершена"
+    }
+
+    Write-Log -Message $completeMsg -Level "SUCCESS" -LogFile $LogFile
     Write-Host ""
-    Write-Host "✅ ОЧИСТКА ЗАВЕРШЕНА УСПЕШНО" -ForegroundColor Green
-    Write-Host "Лог сохранен: $LogFile" -ForegroundColor Gray
-    
+    Write-Host "✅ $completeMsg" -ForegroundColor Green
+    Write-Host ("Лог сохранён: {0}" -f $LogFile) -ForegroundColor Gray
+
     if ($WhatIf) {
         Write-Host ""
-        Write-Host "⚠️  Это был пробный запуск (WhatIf)" -ForegroundColor Yellow
+        Write-Host "⚠ Это был пробный запуск (WhatIf)" -ForegroundColor Yellow
         Write-Host "   Для реальной очистки запустите без параметра -WhatIf" -ForegroundColor Yellow
     }
 }
 
 # ============================================
-# ЗАПУСК СКРИПТА
+# ЗАПУСК
 # ============================================
 
 try {
     Main
 } catch {
     Write-Host ""
-    Write-Host "❌ ОШИБКА: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host ("❌ ОШИБКА: {0}" -f $_.Exception.Message) -ForegroundColor Red
     Write-Host "Подсказка: Используйте -Diagnostic для диагностики или -WhatIf для пробного запуска" -ForegroundColor Yellow
     exit 1
 }
