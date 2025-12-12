@@ -3,23 +3,21 @@
     Professional 1C server cache cleanup with automatic registry-based configuration detection.
 
 .DESCRIPTION
-    Version 3.1.1
-    - Automatically discovers 1C server configuration from Windows registry (SrvInfoPath, version, etc.).
-    - Supports clusters (reg_1cv8 analysis).
+    Version 3.1.2
     - Uses settings.json for configuration (paths, logging, safety).
     - Uses localization (en-US / ru-RU) from psd1 files.
+    - Uses PowerShell native ShouldProcess for -WhatIf / -Confirm (no custom WhatIf parameter).
 
 .VERSION
-    3.1.1
+    3.1.2
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = "High")]
 param (
     [int]$ServiceStopTimeout = 120,
     [string]$SrvInfoPath,
     [ValidateSet("en-US", "ru-RU")]
     [string]$Language,
-    [switch]$WhatIf,
     [switch]$Diagnostic,
     [switch]$Force,
     [switch]$NoServiceRestart
@@ -86,7 +84,7 @@ function Load-1CSettings {
         }
     } else {
         $Script:Config = [PSCustomObject]@{
-            version  = "3.1.1"
+            version  = "3.1.2"
             author   = "1C Server Automation Community"
             defaults = [PSCustomObject]@{
                 serviceStopTimeout = 120
@@ -155,7 +153,6 @@ function Get-1CAgentServiceInfo {
 
         $Service = $Services[0]
         $RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($Service.Name)"
-
         if (-not (Test-Path $RegPath)) { continue }
 
         $RegProperties = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
@@ -210,9 +207,7 @@ function Get-1CClusterNodes {
     $Nodes = @()
     $ClusterRegPath = Join-Path $SrvInfoPath "reg_1cv8"
 
-    if (-not (Test-Path $ClusterRegPath)) {
-        return $Nodes
-    }
+    if (-not (Test-Path $ClusterRegPath)) { return $Nodes }
 
     $RegFiles = Get-ChildItem -Path $ClusterRegPath -Filter "*.reg" -ErrorAction SilentlyContinue
     foreach ($RegFile in $RegFiles) {
@@ -317,7 +312,6 @@ function Write-Log {
     $levelKey = $Level.ToUpper()
     if (-not $Order.ContainsKey($levelKey)) { $levelKey = "INFO" }
     $minKey = if ($Order.ContainsKey($minLevel)) { $minLevel } else { "INFO" }
-
     if ($Order[$levelKey] -lt $Order[$minKey]) { return }
 
     $Colors = @{
@@ -387,7 +381,6 @@ function Test-Safety {
             $prompt = Get-Loc -Section "Prompts" -Key "ConfirmCleanup" -Fallback "Proceed with cache cleanup? [Y/N]: "
             $answer = Read-Host $prompt
             if ($answer -notin @("Y", "y", "Yes", "YES")) {
-                Write-Log -Message (Get-Loc -Section "Messages" -Key "SafetyCheckFailed" -Fallback "Safety check failed: active 1C processes detected.") -Level "WARNING" -LogFile $LogFile
                 return $false
             }
             return $true
@@ -404,47 +397,53 @@ function Test-Safety {
 # SERVICE CONTROL
 # =========================
 
-function Stop-1CServices {
+function Resolve-1CServiceByDisplayName {
     param(
-        [string[]]$ServiceNames,
+        [string]$DisplayName
+    )
+    if ([string]::IsNullOrWhiteSpace($DisplayName)) { return $null }
+    return Get-Service -DisplayName $DisplayName -ErrorAction SilentlyContinue | Select-Object -First 1
+}
+
+function Stop-1CServices {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param(
+        [string[]]$ServiceDisplayNames,
         [int]$Timeout,
-        [string]$LogFile,
-        [switch]$WhatIf
+        [string]$LogFile
     )
 
     $Stopped = @()
 
-    foreach ($ServiceName in $ServiceNames) {
-        $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-        if (-not $Service) {
-            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceNotFound" -Fallback ("Service not found: {0}" -f $ServiceName)) -Level "WARNING" -LogFile $LogFile
+    foreach ($DisplayName in $ServiceDisplayNames) {
+        $svc = Resolve-1CServiceByDisplayName -DisplayName $DisplayName
+        if (-not $svc) {
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceNotFound" -Fallback ("Service not found: {0}" -f $DisplayName)) -Level "WARNING" -LogFile $LogFile
             continue
         }
 
-        if ($Service.Status -eq 'Stopped') {
-            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceAlreadyStopped" -Fallback ("Service already stopped: {0}" -f $ServiceName)) -Level "INFO" -LogFile $LogFile
-            $Stopped += $ServiceName
+        if ($svc.Status -eq 'Stopped') {
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceAlreadyStopped" -Fallback ("Service already stopped: {0}" -f $DisplayName)) -Level "INFO" -LogFile $LogFile
+            $Stopped += $DisplayName
             continue
         }
 
-        if ($WhatIf) {
-            $msg = Get-Loc -Section "Prompts" -Key "WhatIfMode" -Fallback "[WhatIf]"
-            Write-Log -Message ("{0} Would stop service: {1}" -f $msg, $ServiceName) -Level "INFO" -LogFile $LogFile
-            $Stopped += $ServiceName
-            continue
-        }
-
-        try {
-            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStopping" -Fallback ("Stopping service: {0}" -f $ServiceName)) -Level "INFO" -LogFile $LogFile
-            Stop-Service -Name $ServiceName -Force
-            $Service.WaitForStatus('Stopped', (New-TimeSpan -Seconds $Timeout))
-            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStopped" -Fallback ("Service stopped: {0}" -f $ServiceName)) -Level "SUCCESS" -LogFile $LogFile
-            $Stopped += $ServiceName
-        } catch {
-            # FIX: do not use "$ServiceName:" inside an interpolated string
-            $err = ("Failed to stop service {0}: {1}" -f $ServiceName, $_.Exception.Message)
-            Write-Log -Message $err -Level "ERROR" -LogFile $LogFile
-            throw
+        if ($PSCmdlet.ShouldProcess($DisplayName, "Stop service")) {
+            try {
+                Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStopping" -Fallback ("Stopping service: {0}" -f $DisplayName)) -Level "INFO" -LogFile $LogFile
+                Stop-Service -Name $svc.Name -Force
+                $svc.WaitForStatus('Stopped', (New-TimeSpan -Seconds $Timeout))
+                Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStopped" -Fallback ("Service stopped: {0}" -f $DisplayName)) -Level "SUCCESS" -LogFile $LogFile
+                $Stopped += $DisplayName
+            } catch {
+                $err = ("Failed to stop service {0}: {1}" -f $DisplayName, $_.Exception.Message)
+                Write-Log -Message $err -Level "ERROR" -LogFile $LogFile
+                throw
+            }
+        } else {
+            # -WhatIf path
+            Write-Log -Message ("[WhatIf] Would stop service: {0}" -f $DisplayName) -Level "INFO" -LogFile $LogFile
+            $Stopped += $DisplayName
         }
     }
 
@@ -453,30 +452,33 @@ function Stop-1CServices {
 }
 
 function Start-1CServices {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
-        [string[]]$ServiceNames,
-        [string]$LogFile,
-        [switch]$WhatIf
+        [string[]]$ServiceDisplayNames,
+        [string]$LogFile
     )
 
-    foreach ($ServiceName in $ServiceNames) {
-        if ($WhatIf) {
-            $msg = Get-Loc -Section "Prompts" -Key "WhatIfMode" -Fallback "[WhatIf]"
-            Write-Log -Message ("{0} Would start service: {1}" -f $msg, $ServiceName) -Level "INFO" -LogFile $LogFile
+    foreach ($DisplayName in $ServiceDisplayNames) {
+        $svc = Resolve-1CServiceByDisplayName -DisplayName $DisplayName
+        if (-not $svc) {
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceNotFound" -Fallback ("Service not found: {0}" -f $DisplayName)) -Level "WARNING" -LogFile $LogFile
             continue
         }
 
-        try {
-            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStarting" -Fallback ("Starting service: {0}" -f $ServiceName)) -Level "INFO" -LogFile $LogFile
-            Start-Service -Name $ServiceName
-            Start-Sleep -Seconds 5
-            $Status = (Get-Service -Name $ServiceName).Status
-            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStarted" -Fallback ("Service started: {0} (Status: {1})" -f $ServiceName, $Status)) -Level "SUCCESS" -LogFile $LogFile
-        } catch {
-            # FIX: do not use "$ServiceName:" inside an interpolated string
-            $err = ("Failed to start service {0}: {1}" -f $ServiceName, $_.Exception.Message)
-            Write-Log -Message $err -Level "ERROR" -LogFile $LogFile
-            throw
+        if ($PSCmdlet.ShouldProcess($DisplayName, "Start service")) {
+            try {
+                Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStarting" -Fallback ("Starting service: {0}" -f $DisplayName)) -Level "INFO" -LogFile $LogFile
+                Start-Service -Name $svc.Name
+                Start-Sleep -Seconds 5
+                $Status = (Get-Service -Name $svc.Name).Status
+                Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStarted" -Fallback ("Service started: {0} (Status: {1})" -f $DisplayName, $Status)) -Level "SUCCESS" -LogFile $LogFile
+            } catch {
+                $err = ("Failed to start service {0}: {1}" -f $DisplayName, $_.Exception.Message)
+                Write-Log -Message $err -Level "ERROR" -LogFile $LogFile
+                throw
+            }
+        } else {
+            Write-Log -Message ("[WhatIf] Would start service: {0}" -f $DisplayName) -Level "INFO" -LogFile $LogFile
         }
     }
 }
@@ -486,10 +488,10 @@ function Start-1CServices {
 # =========================
 
 function Clear-1CCache {
+    [CmdletBinding(SupportsShouldProcess = $true)]
     param(
         [string]$SrvInfoPath,
-        [string]$LogFile,
-        [switch]$WhatIf
+        [string]$LogFile
     )
 
     Write-Log -Message (Get-Loc -Section "Messages" -Key "CleanupStarting" -Fallback ("Starting cache cleanup: {0}" -f $SrvInfoPath)) -Level "INFO" -LogFile $LogFile
@@ -514,16 +516,19 @@ function Clear-1CCache {
             $Files = Get-ChildItem -Path $Dir.FullName -File -Recurse -ErrorAction SilentlyContinue
             $FileCount = $Files.Count
 
-            if ($WhatIf) {
+            if ($FileCount -le 0) {
+                $TotalDirs++
+                continue
+            }
+
+            if ($PSCmdlet.ShouldProcess($Dir.FullName, ("Remove {0} files" -f $FileCount))) {
+                $Files | Remove-Item -Force -ErrorAction SilentlyContinue
+                $msg = Get-Loc -Section "Messages" -Key "CacheDirCleaned" -Fallback ("Cleaned: {0} ({1} files)" -f $Dir.FullName, $FileCount)
+                Write-Log -Message $msg -Level "INFO" -LogFile $LogFile
+                $TotalFiles += $FileCount
+            } else {
                 $msg = Get-Loc -Section "Messages" -Key "CacheDirFoundWhatIf" -Fallback ("[WhatIf] Found cache directory: {0} ({1} files)" -f $Dir.FullName, $FileCount)
                 Write-Log -Message $msg -Level "INFO" -LogFile $LogFile
-            } else {
-                if ($FileCount -gt 0) {
-                    $Files | Remove-Item -Force -ErrorAction SilentlyContinue
-                    $msg = Get-Loc -Section "Messages" -Key "CacheDirCleaned" -Fallback ("Cleaned: {0} ({1} files)" -f $Dir.FullName, $FileCount)
-                    Write-Log -Message $msg -Level "INFO" -LogFile $LogFile
-                    $TotalFiles += $FileCount
-                }
             }
 
             $TotalDirs++
@@ -656,12 +661,8 @@ function Main {
         $ServiceDisplayServer = $Script:Config.serviceNames.server[$Script:LanguageEffective]
     }
 
-    if (-not $ServiceDisplayAgent) {
-        $ServiceDisplayAgent = Get-Loc -Section "ServiceNames" -Key "Agent" -Fallback $null
-    }
-    if (-not $ServiceDisplayServer) {
-        $ServiceDisplayServer = Get-Loc -Section "ServiceNames" -Key "Server" -Fallback $null
-    }
+    if (-not $ServiceDisplayAgent) { $ServiceDisplayAgent = Get-Loc -Section "ServiceNames" -Key "Agent" -Fallback $null }
+    if (-not $ServiceDisplayServer) { $ServiceDisplayServer = Get-Loc -Section "ServiceNames" -Key "Server" -Fallback $null }
 
     $ServicesToManage = @()
     if ($ServiceDisplayAgent) { $ServicesToManage += $ServiceDisplayAgent }
@@ -671,8 +672,7 @@ function Main {
         $prompt = Get-Loc -Section "Prompts" -Key "ConfirmCleanup" -Fallback "Proceed with cache cleanup? [Y/N]: "
         $answer = Read-Host $prompt
         if ($answer -notin @("Y", "y", "Yes", "YES")) {
-            $m = Get-Loc -Section "Messages" -Key "Completion" -Fallback "Operation cancelled."
-            Write-Log -Message $m -Level "WARNING" -LogFile $LogFile
+            Write-Log -Message "Operation cancelled by user." -Level "WARNING" -LogFile $LogFile
             return
         }
     }
@@ -685,18 +685,19 @@ function Main {
     }
 
     $StoppedServices = @()
+
     if (-not $NoServiceRestart -and $ServicesToManage.Count -gt 0) {
         Write-Log -Message (Get-Loc -Section "Messages" -Key "ServicesStopping" -Fallback "Stopping 1C services...") -Level "INFO" -LogFile $LogFile
-        $StoppedServices = Stop-1CServices -ServiceNames $ServicesToManage -Timeout $EffectiveTimeout -LogFile $LogFile -WhatIf:$WhatIf
+        $StoppedServices = Stop-1CServices -ServiceDisplayNames $ServicesToManage -Timeout $EffectiveTimeout -LogFile $LogFile
     } else {
-        Write-Log -Message (Get-Loc -Section "Messages" -Key "ServicesStopping" -Fallback "Service stop is skipped.") -Level "INFO" -LogFile $LogFile
+        Write-Log -Message "Service stop is skipped." -Level "INFO" -LogFile $LogFile
     }
 
-    Clear-1CCache -SrvInfoPath $TargetPath -LogFile $LogFile -WhatIf:$WhatIf
+    Clear-1CCache -SrvInfoPath $TargetPath -LogFile $LogFile
 
     if (-not $NoServiceRestart -and $StoppedServices.Count -gt 0) {
         Write-Log -Message (Get-Loc -Section "Messages" -Key "ServicesStarting" -Fallback "Starting 1C services...") -Level "INFO" -LogFile $LogFile
-        Start-1CServices -ServiceNames $StoppedServices -LogFile $LogFile -WhatIf:$WhatIf
+        Start-1CServices -ServiceDisplayNames $StoppedServices -LogFile $LogFile
     }
 
     $completeMsg = Get-Loc -Section "Messages" -Key "Completion" -Fallback "Cache cleanup completed successfully."
@@ -705,7 +706,7 @@ function Main {
     Write-Host $completeMsg -ForegroundColor Green
     Write-Host ((Get-Loc -Section "Messages" -Key "LogFilePath" -Fallback "Log file: {0}") -f $LogFile) -ForegroundColor Gray
 
-    if ($WhatIf) {
+    if ($WhatIfPreference) {
         Write-Host (Get-Loc -Section "Messages" -Key "DryRunNotice1" -Fallback "This was a dry run (WhatIf mode).") -ForegroundColor Yellow
         Write-Host (Get-Loc -Section "Messages" -Key "DryRunNotice2" -Fallback "Run without -WhatIf to perform actual cleanup.") -ForegroundColor Yellow
     }
