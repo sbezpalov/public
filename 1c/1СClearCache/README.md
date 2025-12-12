@@ -1,36 +1,57 @@
-# 🚀 1C Server Cache Cleaner Professional
+# Clear-1CServerCache
 
-A minimalistic, powerful PowerShell script for automated cleaning of 1C Enterprise Server session cache with intelligent registry detection and multi-language support.
+Enterprise-grade PowerShell script for safe cleanup of **1C:Enterprise server cache** in maintenance windows.
 
-## ✨ Features
+The script is designed for production environments and follows a strict principle:
 
-### 🔍 Smart Detection
-- **Automatic Registry Reading** - Finds 1C installation paths from Windows Registry
-- **Multi-Version Support** - Works with 1C 8.2, 8.3, and newer versions
-- **Cluster Aware** - Automatically detects 1C cluster configurations
-- **Architecture Detection** - Supports x86, x64, and x86-64 installations
+> **If 1C services are not registered in the Windows registry, there is nothing to clean.**
 
-### 🛡️ Safety First
-- **Active Session Detection** - Prevents cleaning during active 1C user sessions
-- **Graceful Service Management** - Proper service stop/start sequences
-- **Dry Run Mode** - Preview actions without execution (`-WhatIf`)
-- **Force Mode** - Bypass safety checks when needed (`-Force`)
+Registry is the single source of truth.
 
-### 🌐 Multi-Language
-- **Full Localization** - English (en-US) and Russian (ru-RU) support
-- **Automatic Detection** - Uses system language by default
-- **Easy to Extend** - Add new languages by creating `.psd1` files
+---
 
-### 📊 Production Ready
-- **Comprehensive Logging** - Console, file, and Windows Event Log
-- **Error Handling** - Proper error recovery and reporting
-- **Parameterized** - Flexible command-line options
-- **Scheduling Ready** - Easy integration with Task Scheduler
+## Key Features
 
-## 🚀 Quick Start
+- Registry-driven detection of 1C server services (`ragent.exe`)
+- Automatic discovery of `SrvInfoPath` from service startup parameters (`-d`)
+- Safe maintenance workflow:
+  - Stop services
+  - Clean server cache
+  - Start services
+- Correct service restart order:
+  - Stop: **Server → Agent**
+  - Start: **Agent → Server**
+- Native PowerShell `-WhatIf` / `-Confirm` support
+- Robust localization support (EN / RU)
+- ASCII-only script body (UTF only in localization files)
+- Designed for scheduled maintenance windows
 
-### Prerequisites
-- **Windows Server** 2012 R2 or later
-- **PowerShell** 5.1 or higher
-- **1C Enterprise Server** 8.2 or later
-- **Administrative privileges**
+---
+
+## Requirements
+
+- Windows Server / Windows with 1C:Enterprise Server installed
+- PowerShell 5.1+
+- Administrative privileges
+
+---
+
+## Usage
+
+```powershell
+.\Clear-1CServerCache.ps1
+```
+
+Dry run:
+
+```powershell
+.\Clear-1CServerCache.ps1 -WhatIf
+```
+
+---
+
+## Version
+
+Current version: **3.1.6**
+
+---
