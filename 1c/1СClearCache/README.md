@@ -53,5 +53,3 @@ Dry run:
 ## Version
 
 Current version: **3.1.5**
-
----
