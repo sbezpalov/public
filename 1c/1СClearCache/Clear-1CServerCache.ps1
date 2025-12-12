@@ -3,58 +3,14 @@
     Professional 1C server cache cleanup with automatic registry-based configuration detection.
 
 .DESCRIPTION
-    Version 3.1.0
+    Version 3.1.1
     - Automatically discovers 1C server configuration from Windows registry (SrvInfoPath, version, etc.).
     - Supports clusters (reg_1cv8 analysis).
     - Uses settings.json for configuration (paths, logging, safety).
     - Uses localization (en-US / ru-RU) from psd1 files.
 
-.AUTHOR
-    1C Server Automation Community
-
 .VERSION
-    3.1.0
-
-.PARAMETER ServiceStopTimeout
-    Service stop timeout in seconds (default: settings.json -> defaults.serviceStopTimeout).
-
-.PARAMETER SrvInfoPath
-    Explicit srvinfo path (if auto detection is not possible or needs to be overridden).
-
-.PARAMETER Language
-    UI language: en-US or ru-RU.
-    If not specified, settings.json defaults.language is used:
-        - "auto"   -> current system culture
-        - "en-US" / "ru-RU" -> explicit language
-
-.PARAMETER WhatIf
-    Dry run mode: no real service stop or file deletion.
-
-.PARAMETER Diagnostic
-    Diagnostic mode: prints 1C configuration info (no cleanup).
-
-.PARAMETER Force
-    Skip safety checks (active sessions and path sanity).
-    WARNING: use only if you understand the risks.
-
-.PARAMETER NoServiceRestart
-    Do not stop or start 1C services (not recommended for cache cleanup).
-
-.EXAMPLE
-    .\Clear-1CServerCache.ps1
-    Standard cleanup using settings.json configuration.
-
-.EXAMPLE
-    .\Clear-1CServerCache.ps1 -SrvInfoPath "C:\Program Files\1cv8\srvinfo"
-    Cleanup using explicitly specified srvinfo path.
-
-.EXAMPLE
-    .\Clear-1CServerCache.ps1 -WhatIf
-    Dry run without actual cleanup.
-
-.EXAMPLE
-    .\Clear-1CServerCache.ps1 -Language ru-RU
-    Cleanup with Russian UI.
+    3.1.1
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -69,20 +25,35 @@ param (
     [switch]$NoServiceRestart
 )
 
-# ============================================
-# GLOBAL SCRIPT VARIABLES
-# ============================================
-
 # Configuration from settings.json
 $Script:Config = $null
-# Localization data (Messages, Prompts, ServiceNames)
+# Localization data (Messages, Prompts, ServiceNames, Diagnostics)
 $Script:Localization = $null
-# Effective language (en-US / ru-RU)
+# Effective language
 $Script:LanguageEffective = "en-US"
 
-# ============================================
+function Get-Loc {
+    param(
+        [string]$Section,
+        [string]$Key,
+        [string]$Fallback = ""
+    )
+    try {
+        $obj = $Script:Localization
+        if (-not $obj) { return $Fallback }
+        $sectionObj = $obj.$Section
+        if (-not $sectionObj) { return $Fallback }
+        $val = $sectionObj.$Key
+        if ([string]::IsNullOrWhiteSpace($val)) { return $Fallback }
+        return $val
+    } catch {
+        return $Fallback
+    }
+}
+
+# =========================
 # LOCALIZATION
-# ============================================
+# =========================
 
 function Get-1CLocalization {
     param(
@@ -94,14 +65,14 @@ function Get-1CLocalization {
 
     if (Test-Path $LocalizationFile) {
         return Import-LocalizedData -BaseDirectory $LocalizationPath -FileName "$Language.psd1"
-    } else {
-        return Import-LocalizedData -BaseDirectory $LocalizationPath -FileName "en-US.psd1"
     }
+
+    return Import-LocalizedData -BaseDirectory $LocalizationPath -FileName "en-US.psd1"
 }
 
-# ============================================
-# SETTINGS LOAD AND INITIALIZATION
-# ============================================
+# =========================
+# SETTINGS AND INIT
+# =========================
 
 function Load-1CSettings {
     $ConfigPath = Join-Path $PSScriptRoot "settings.json"
@@ -111,12 +82,11 @@ function Load-1CSettings {
             $json = Get-Content $ConfigPath -Raw -Encoding UTF8
             $Script:Config = $json | ConvertFrom-Json
         } catch {
-            throw "Failed to read settings.json: $($_.Exception.Message)"
+            throw ("Failed to read settings.json: {0}" -f $_.Exception.Message)
         }
     } else {
-        # Minimal default configuration if settings.json is missing
         $Script:Config = [PSCustomObject]@{
-            version  = "3.1.0"
+            version  = "3.1.1"
             author   = "1C Server Automation Community"
             defaults = [PSCustomObject]@{
                 serviceStopTimeout = 120
@@ -141,7 +111,6 @@ function Load-1CSettings {
         }
     }
 
-    # Determine effective language
     if ($PSBoundParameters.ContainsKey('Language') -and $Language) {
         $Script:LanguageEffective = $Language
     } else {
@@ -164,17 +133,16 @@ function Test-Admin {
     $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw "Script must be run as Administrator."
+        $msg = Get-Loc -Section "Messages" -Key "AdminRequired" -Fallback "Script must be run as Administrator."
+        throw $msg
     }
 }
 
-# ============================================
-# REGISTRY / 1C CONFIG DISCOVERY
-# ============================================
+# =========================
+# REGISTRY / 1C DISCOVERY
+# =========================
 
 function Get-1CAgentServiceInfo {
-    # Try to discover 1C Agent service by DisplayName patterns.
-    # Patterns may be extended or overridden via settings.json / localization if needed.
     $AgentPatterns = @(
         "1C:Enterprise 8.3 Server Agent*",
         "1C:Enterprise 8.3 Server Agent (x86-64)*",
@@ -183,54 +151,51 @@ function Get-1CAgentServiceInfo {
 
     foreach ($Pattern in $AgentPatterns) {
         $Services = Get-Service -DisplayName $Pattern -ErrorAction SilentlyContinue
-        if ($Services) {
-            $Service = $Services[0]
-            $RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($Service.Name)"
+        if (-not $Services) { continue }
 
-            if (Test-Path $RegPath) {
-                $RegProperties = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
-                if ($RegProperties -and $RegProperties.ImagePath) {
+        $Service = $Services[0]
+        $RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$($Service.Name)"
 
-                    # Parse ragent.exe parameters from ImagePath
-                    $Parameters = @{}
-                    if ($RegProperties.ImagePath -match 'ragent\.exe\s+(.*)$') {
-                        $ArgsString = $Matches[1]
-                        $Tokens = $ArgsString -split '\s+' | Where-Object { $_ }
+        if (-not (Test-Path $RegPath)) { continue }
 
-                        for ($i = 0; $i -lt $Tokens.Count; $i++) {
-                            if ($Tokens[$i] -match '^-(\w+)$') {
-                                $ParamName = $Matches[1]
-                                if ($i + 1 -lt $Tokens.Count -and $Tokens[$i + 1] -notmatch '^-') {
-                                    $Parameters[$ParamName] = $Tokens[$i + 1].Trim('"')
-                                    $i++
-                                } else {
-                                    $Parameters[$ParamName] = $true
-                                }
-                            }
-                        }
-                    }
+        $RegProperties = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
+        if (-not ($RegProperties -and $RegProperties.ImagePath)) { continue }
 
-                    $SrvInfoPath = $null
-                    if ($Parameters.ContainsKey('d')) {
-                        $SrvInfoPath = $Parameters['d']
-                    }
+        $Parameters = @{}
+        if ($RegProperties.ImagePath -match 'ragent\.exe\s+(.*)$') {
+            $ArgsString = $Matches[1]
+            $Tokens = $ArgsString -split '\s+' | Where-Object { $_ }
 
-                    # Try to detect version from path
-                    $Version = $null
-                    if ($RegProperties.ImagePath -match '([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)') {
-                        $Version = $Matches[1]
-                    }
-
-                    return [PSCustomObject]@{
-                        ServiceName = $Service.Name
-                        DisplayName = $Service.DisplayName
-                        ImagePath   = $RegProperties.ImagePath
-                        Parameters  = $Parameters
-                        SrvInfoPath = $SrvInfoPath
-                        Version     = $Version
+            for ($i = 0; $i -lt $Tokens.Count; $i++) {
+                if ($Tokens[$i] -match '^-(\w+)$') {
+                    $ParamName = $Matches[1]
+                    if ($i + 1 -lt $Tokens.Count -and $Tokens[$i + 1] -notmatch '^-') {
+                        $Parameters[$ParamName] = $Tokens[$i + 1].Trim('"')
+                        $i++
+                    } else {
+                        $Parameters[$ParamName] = $true
                     }
                 }
             }
+        }
+
+        $DetectedSrvInfo = $null
+        if ($Parameters.ContainsKey('d')) {
+            $DetectedSrvInfo = $Parameters['d']
+        }
+
+        $Version = $null
+        if ($RegProperties.ImagePath -match '([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)') {
+            $Version = $Matches[1]
+        }
+
+        return [PSCustomObject]@{
+            ServiceName = $Service.Name
+            DisplayName = $Service.DisplayName
+            ImagePath   = $RegProperties.ImagePath
+            Parameters  = $Parameters
+            SrvInfoPath = $DetectedSrvInfo
+            Version     = $Version
         }
     }
 
@@ -245,20 +210,22 @@ function Get-1CClusterNodes {
     $Nodes = @()
     $ClusterRegPath = Join-Path $SrvInfoPath "reg_1cv8"
 
-    if (Test-Path $ClusterRegPath) {
-        $RegFiles = Get-ChildItem -Path $ClusterRegPath -Filter "*.reg" -ErrorAction SilentlyContinue
-        foreach ($RegFile in $RegFiles) {
-            $Content = Get-Content $RegFile.FullName -Raw -ErrorAction SilentlyContinue
-            if ($Content -match '"AgentHost"="([^"]+)"') {
-                $NodeInfo = @{
-                    NodeName = $Matches[1]
-                    RegFile  = $RegFile.FullName
-                }
-                if ($Content -match '"AgentPort"="(\d+)"') {
-                    $NodeInfo.AgentPort = [int]$Matches[1]
-                }
-                $Nodes += [PSCustomObject]$NodeInfo
+    if (-not (Test-Path $ClusterRegPath)) {
+        return $Nodes
+    }
+
+    $RegFiles = Get-ChildItem -Path $ClusterRegPath -Filter "*.reg" -ErrorAction SilentlyContinue
+    foreach ($RegFile in $RegFiles) {
+        $Content = Get-Content $RegFile.FullName -Raw -ErrorAction SilentlyContinue
+        if ($Content -match '"AgentHost"="([^"]+)"') {
+            $NodeInfo = @{
+                NodeName = $Matches[1]
+                RegFile  = $RegFile.FullName
             }
+            if ($Content -match '"AgentPort"="(\d+)"') {
+                $NodeInfo.AgentPort = [int]$Matches[1]
+            }
+            $Nodes += [PSCustomObject]$NodeInfo
         }
     }
 
@@ -268,7 +235,7 @@ function Get-1CClusterNodes {
 function Get-1CFullConfiguration {
     $AgentService = Get-1CAgentServiceInfo
 
-    $SrvInfoPath = if ($AgentService -and $AgentService.SrvInfoPath) {
+    $SrvInfo = if ($AgentService -and $AgentService.SrvInfoPath) {
         $AgentService.SrvInfoPath
     } elseif ($Script:Config -and $Script:Config.paths.defaultSrvInfo) {
         $Script:Config.paths.defaultSrvInfo
@@ -277,22 +244,20 @@ function Get-1CFullConfiguration {
     }
 
     $ClusterNodes = @()
-    if ($SrvInfoPath) {
-        $ClusterNodes = Get-1CClusterNodes -SrvInfoPath $SrvInfoPath
+    if ($SrvInfo) {
+        $ClusterNodes = Get-1CClusterNodes -SrvInfoPath $SrvInfo
     }
 
-    $Config = @{
+    return [PSCustomObject]@{
         AgentService = $AgentService
-        SrvInfoPath  = $SrvInfoPath
+        SrvInfoPath  = $SrvInfo
         ClusterNodes = $ClusterNodes
     }
-
-    return [PSCustomObject]$Config
 }
 
-# ============================================
+# =========================
 # LOGGING
-# ============================================
+# =========================
 
 function Initialize-Logging {
     param(
@@ -309,7 +274,6 @@ function Initialize-Logging {
         New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
     }
 
-    # Log retention
     $RetentionDays = 0
     if ($Config -and $Config.defaults -and $Config.defaults.logRetentionDays) {
         $RetentionDays = [int]$Config.defaults.logRetentionDays
@@ -323,8 +287,7 @@ function Initialize-Logging {
     }
 
     $Timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $LogFile   = Join-Path $LogDir "1CCacheCleaner_$Timestamp.log"
-    return $LogFile
+    return (Join-Path $LogDir ("1CCacheCleaner_{0}.log" -f $Timestamp))
 }
 
 function Write-Log {
@@ -336,9 +299,8 @@ function Write-Log {
     )
 
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $Formatted = "[$Timestamp] [$Level] $Message"
+    $Formatted = "[{0}] [{1}] {2}" -f $Timestamp, $Level, $Message
 
-    # Determine minimal log level
     $minLevel = "INFO"
     if ($Script:Config -and $Script:Config.logging -and $Script:Config.logging.level) {
         $minLevel = $Script:Config.logging.level.ToUpper()
@@ -353,17 +315,11 @@ function Write-Log {
     }
 
     $levelKey = $Level.ToUpper()
-    if (-not $Order.ContainsKey($levelKey)) {
-        $levelKey = "INFO"
-    }
-
+    if (-not $Order.ContainsKey($levelKey)) { $levelKey = "INFO" }
     $minKey = if ($Order.ContainsKey($minLevel)) { $minLevel } else { "INFO" }
 
-    if ($Order[$levelKey] -lt $Order[$minKey]) {
-        return
-    }
+    if ($Order[$levelKey] -lt $Order[$minKey]) { return }
 
-    # Console output
     $Colors = @{
         DEBUG   = "DarkGray"
         INFO    = "White"
@@ -371,16 +327,13 @@ function Write-Log {
         ERROR   = "Red"
         SUCCESS = "Green"
     }
-
     $color = if ($Colors.ContainsKey($levelKey)) { $Colors[$levelKey] } else { "White" }
     Write-Host $Formatted -ForegroundColor $color
 
-    # Log file output
     if ($LogFile) {
         $Formatted | Out-File -FilePath $LogFile -Append -Encoding UTF8
     }
 
-    # Event Log (only WARNING/ERROR and only if enabled in config)
     if ($Script:Config -and $Script:Config.logging.enableEventLog -and $levelKey -in @("ERROR", "WARNING")) {
         try {
             $sourceName = "1C Cache Cleaner"
@@ -394,14 +347,14 @@ function Write-Log {
             }
             Write-EventLog -LogName "Application" -Source $sourceName -EventId $EventId -EntryType $levelKey -Message $Message
         } catch {
-            # EventLog errors must not break main logic
+            # Do not break main flow on EventLog failures
         }
     }
 }
 
-# ============================================
+# =========================
 # SAFETY
-# ============================================
+# =========================
 
 function Test-Safety {
     param(
@@ -410,69 +363,46 @@ function Test-Safety {
     )
 
     if ($Force) {
-        if ($LogFile) {
-            Write-Log -Message "Force parameter is set: safety checks are skipped." -Level "WARNING" -LogFile $LogFile
-        }
+        Write-Log -Message (Get-Loc -Section "Messages" -Key "ForceSkipsSafety" -Fallback "Force is set: safety checks are skipped.") -Level "WARNING" -LogFile $LogFile
         return $true
     }
 
     if ($Script:Config -and $Script:Config.safety -and -not $Script:Config.safety.checkActiveSessions) {
-        if ($LogFile) {
-            Write-Log -Message "Active 1C session check is disabled in settings.json." -Level "WARNING" -LogFile $LogFile
-        }
+        Write-Log -Message (Get-Loc -Section "Messages" -Key "ActiveSessionCheckDisabled" -Fallback "Active session check is disabled in settings.json.") -Level "WARNING" -LogFile $LogFile
         return $true
     }
 
-    # Check active 1C processes
     $Processes1C = Get-Process -Name "1cv8", "1cv8c", "1cv8s" -ErrorAction SilentlyContinue
     if ($Processes1C) {
-        $warningText = if ($Script:Localization -and $Script:Localization.Prompts.WarningActiveSessions) {
-            $Script:Localization.Prompts.WarningActiveSessions
-        } else {
-            "WARNING: Active 1C processes found."
-        }
-
+        $warningText = Get-Loc -Section "Prompts" -Key "WarningActiveSessions" -Fallback "WARNING: Active 1C processes found."
         Write-Host $warningText -ForegroundColor Red -BackgroundColor Black
-        $Processes1C | ForEach-Object {
-            Write-Host ("  - {0} (PID: {1})" -f $_.ProcessName, $_.Id) -ForegroundColor Red
+
+        foreach ($p in $Processes1C) {
+            Write-Host ("  - {0} (PID: {1})" -f $p.ProcessName, $p.Id) -ForegroundColor Red
         }
 
-        if ($LogFile) {
-            Write-Log -Message "Active 1C processes detected; cache cleanup may be unsafe." -Level "ERROR" -LogFile $LogFile
-        }
+        Write-Log -Message (Get-Loc -Section "Messages" -Key "SafetyCheckFailed" -Fallback "Safety check failed: active 1C processes detected.") -Level "ERROR" -LogFile $LogFile
 
         if ($Script:Config.safety.requireConfirmation) {
-            $prompt = if ($Script:Localization -and $Script:Localization.Prompts.ConfirmCleanup) {
-                $Script:Localization.Prompts.ConfirmCleanup
-            } else {
-                "Proceed with cache cleanup? [Y/N]: "
-            }
-
+            $prompt = Get-Loc -Section "Prompts" -Key "ConfirmCleanup" -Fallback "Proceed with cache cleanup? [Y/N]: "
             $answer = Read-Host $prompt
             if ($answer -notin @("Y", "y", "Yes", "YES")) {
-                if ($LogFile) {
-                    Write-Log -Message "Cache cleanup cancelled by user due to active sessions." -Level "WARNING" -LogFile $LogFile
-                }
+                Write-Log -Message (Get-Loc -Section "Messages" -Key "SafetyCheckFailed" -Fallback "Safety check failed: active 1C processes detected.") -Level "WARNING" -LogFile $LogFile
                 return $false
             }
-
             return $true
-        } else {
-            # If confirmation is disabled, require explicit Force
-            return $false
         }
+
+        return $false
     }
 
-    if ($LogFile -and $Script:Localization -and $Script:Localization.Messages.SafetyCheckPassed) {
-        Write-Log -Message $Script:Localization.Messages.SafetyCheckPassed -Level "INFO" -LogFile $LogFile
-    }
-
+    Write-Log -Message (Get-Loc -Section "Messages" -Key "SafetyCheckPassed" -Fallback "Safety check passed.") -Level "INFO" -LogFile $LogFile
     return $true
 }
 
-# ============================================
+# =========================
 # SERVICE CONTROL
-# ============================================
+# =========================
 
 function Stop-1CServices {
     param(
@@ -487,30 +417,33 @@ function Stop-1CServices {
     foreach ($ServiceName in $ServiceNames) {
         $Service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if (-not $Service) {
-            Write-Log -Message "Service not found: $ServiceName" -Level "WARNING" -LogFile $LogFile
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceNotFound" -Fallback ("Service not found: {0}" -f $ServiceName)) -Level "WARNING" -LogFile $LogFile
             continue
         }
 
         if ($Service.Status -eq 'Stopped') {
-            Write-Log -Message "Service already stopped: $ServiceName" -Level "INFO" -LogFile $LogFile
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceAlreadyStopped" -Fallback ("Service already stopped: {0}" -f $ServiceName)) -Level "INFO" -LogFile $LogFile
             $Stopped += $ServiceName
             continue
         }
 
         if ($WhatIf) {
-            Write-Log -Message "[WhatIf] Would stop service: $ServiceName" -Level "INFO" -LogFile $LogFile
+            $msg = Get-Loc -Section "Prompts" -Key "WhatIfMode" -Fallback "[WhatIf]"
+            Write-Log -Message ("{0} Would stop service: {1}" -f $msg, $ServiceName) -Level "INFO" -LogFile $LogFile
             $Stopped += $ServiceName
             continue
         }
 
         try {
-            Write-Log -Message "Stopping service: $ServiceName" -Level "INFO" -LogFile $LogFile
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStopping" -Fallback ("Stopping service: {0}" -f $ServiceName)) -Level "INFO" -LogFile $LogFile
             Stop-Service -Name $ServiceName -Force
             $Service.WaitForStatus('Stopped', (New-TimeSpan -Seconds $Timeout))
-            Write-Log -Message "Service stopped: $ServiceName" -Level "SUCCESS" -LogFile $LogFile
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStopped" -Fallback ("Service stopped: {0}" -f $ServiceName)) -Level "SUCCESS" -LogFile $LogFile
             $Stopped += $ServiceName
         } catch {
-            Write-Log -Message "Failed to stop service $ServiceName: $($_.Exception.Message)" -Level "ERROR" -LogFile $LogFile
+            # FIX: do not use "$ServiceName:" inside an interpolated string
+            $err = ("Failed to stop service {0}: {1}" -f $ServiceName, $_.Exception.Message)
+            Write-Log -Message $err -Level "ERROR" -LogFile $LogFile
             throw
         }
     }
@@ -528,26 +461,29 @@ function Start-1CServices {
 
     foreach ($ServiceName in $ServiceNames) {
         if ($WhatIf) {
-            Write-Log -Message "[WhatIf] Would start service: $ServiceName" -Level "INFO" -LogFile $LogFile
+            $msg = Get-Loc -Section "Prompts" -Key "WhatIfMode" -Fallback "[WhatIf]"
+            Write-Log -Message ("{0} Would start service: {1}" -f $msg, $ServiceName) -Level "INFO" -LogFile $LogFile
             continue
         }
 
         try {
-            Write-Log -Message "Starting service: $ServiceName" -Level "INFO" -LogFile $LogFile
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStarting" -Fallback ("Starting service: {0}" -f $ServiceName)) -Level "INFO" -LogFile $LogFile
             Start-Service -Name $ServiceName
             Start-Sleep -Seconds 5
             $Status = (Get-Service -Name $ServiceName).Status
-            Write-Log -Message "Service started: $ServiceName (Status: $Status)" -Level "SUCCESS" -LogFile $LogFile
+            Write-Log -Message (Get-Loc -Section "Messages" -Key "ServiceStarted" -Fallback ("Service started: {0} (Status: {1})" -f $ServiceName, $Status)) -Level "SUCCESS" -LogFile $LogFile
         } catch {
-            Write-Log -Message "Failed to start service $ServiceName: $($_.Exception.Message)" -Level "ERROR" -LogFile $LogFile
+            # FIX: do not use "$ServiceName:" inside an interpolated string
+            $err = ("Failed to start service {0}: {1}" -f $ServiceName, $_.Exception.Message)
+            Write-Log -Message $err -Level "ERROR" -LogFile $LogFile
             throw
         }
     }
 }
 
-# ============================================
+# =========================
 # CACHE CLEANUP
-# ============================================
+# =========================
 
 function Clear-1CCache {
     param(
@@ -556,22 +492,21 @@ function Clear-1CCache {
         [switch]$WhatIf
     )
 
-    Write-Log -Message "Starting cache cleanup: $SrvInfoPath" -Level "INFO" -LogFile $LogFile
+    Write-Log -Message (Get-Loc -Section "Messages" -Key "CleanupStarting" -Fallback ("Starting cache cleanup: {0}" -f $SrvInfoPath)) -Level "INFO" -LogFile $LogFile
 
     if (-not (Test-Path $SrvInfoPath)) {
-        Write-Log -Message "Path not found: $SrvInfoPath" -Level "ERROR" -LogFile $LogFile
-        throw "Path not found: $SrvInfoPath"
+        $m = Get-Loc -Section "Messages" -Key "PathNotFound" -Fallback ("Path not found: {0}" -f $SrvInfoPath)
+        Write-Log -Message $m -Level "ERROR" -LogFile $LogFile
+        throw $m
     }
 
-    # Find cache directories snccntx*
     $CacheDirs = Get-ChildItem -Path $SrvInfoPath -Directory -Filter "snccntx*" -Recurse -ErrorAction SilentlyContinue
-
     if (-not $CacheDirs) {
-        Write-Log -Message "No cache directories found under $SrvInfoPath" -Level "WARNING" -LogFile $LogFile
+        Write-Log -Message (Get-Loc -Section "Messages" -Key "CacheDirsNotFound" -Fallback ("No cache directories found under {0}" -f $SrvInfoPath)) -Level "WARNING" -LogFile $LogFile
         return
     }
 
-    $TotalDirs  = 0
+    $TotalDirs = 0
     $TotalFiles = 0
 
     foreach ($Dir in $CacheDirs) {
@@ -580,85 +515,90 @@ function Clear-1CCache {
             $FileCount = $Files.Count
 
             if ($WhatIf) {
-                Write-Log -Message "[WhatIf] Found cache directory: $($Dir.FullName) ($FileCount files)" -Level "INFO" -LogFile $LogFile
+                $msg = Get-Loc -Section "Messages" -Key "CacheDirFoundWhatIf" -Fallback ("[WhatIf] Found cache directory: {0} ({1} files)" -f $Dir.FullName, $FileCount)
+                Write-Log -Message $msg -Level "INFO" -LogFile $LogFile
             } else {
                 if ($FileCount -gt 0) {
                     $Files | Remove-Item -Force -ErrorAction SilentlyContinue
-                    Write-Log -Message "Cleaned: $($Dir.FullName) ($FileCount files)" -Level "INFO" -LogFile $LogFile
+                    $msg = Get-Loc -Section "Messages" -Key "CacheDirCleaned" -Fallback ("Cleaned: {0} ({1} files)" -f $Dir.FullName, $FileCount)
+                    Write-Log -Message $msg -Level "INFO" -LogFile $LogFile
                     $TotalFiles += $FileCount
                 }
             }
 
             $TotalDirs++
         } catch {
-            Write-Log -Message "Error cleaning $($Dir.FullName): $($_.Exception.Message)" -Level "ERROR" -LogFile $LogFile
+            $msg = Get-Loc -Section "Messages" -Key "CacheDirCleanError" -Fallback ("Error cleaning {0}: {1}" -f $Dir.FullName, $_.Exception.Message)
+            Write-Log -Message $msg -Level "ERROR" -LogFile $LogFile
         }
     }
 
-    Write-Log -Message "Cache cleanup completed: $TotalDirs directories, $TotalFiles files" -Level "SUCCESS" -LogFile $LogFile
+    $final = Get-Loc -Section "Messages" -Key "CacheCleanupCompleted" -Fallback ("Cache cleanup completed: {0} directories, {1} files" -f $TotalDirs, $TotalFiles)
+    Write-Log -Message $final -Level "SUCCESS" -LogFile $LogFile
 }
 
-# ============================================
+# =========================
 # DIAGNOSTICS
-# ============================================
+# =========================
 
 function Show-Diagnostics {
     $Config = Get-1CFullConfiguration
 
-    Write-Host "=== 1C SERVER DIAGNOSTICS ===" -ForegroundColor Cyan
+    Write-Host (Get-Loc -Section "Diagnostics" -Key "Header" -Fallback "=== 1C SERVER DIAGNOSTICS ===") -ForegroundColor Cyan
     Write-Host ""
 
     if ($Config.AgentService) {
-        Write-Host "AGENT SERVICE:" -ForegroundColor Green
+        Write-Host (Get-Loc -Section "Diagnostics" -Key "AgentServiceHeader" -Fallback "AGENT SERVICE:") -ForegroundColor Green
         Write-Host ("  Display name: {0}" -f $Config.AgentService.DisplayName) -ForegroundColor Yellow
         Write-Host ("  Version:      {0}" -f $Config.AgentService.Version) -ForegroundColor Gray
-        $srvInfo = if ($Config.AgentService.SrvInfoPath) { $Config.AgentService.SrvInfoPath } else { "<not detected>" }
+
+        $notDetected = Get-Loc -Section "Diagnostics" -Key "NotDetected" -Fallback "<not detected>"
+        $srvInfo = if ($Config.AgentService.SrvInfoPath) { $Config.AgentService.SrvInfoPath } else { $notDetected }
         Write-Host ("  SrvInfo path: {0}" -f $srvInfo) -ForegroundColor (if ($Config.AgentService.SrvInfoPath) { "Green" } else { "Red" })
 
         if ($Config.AgentService.Parameters.Count -gt 0) {
-            Write-Host "  Parameters:" -ForegroundColor Gray
+            Write-Host (Get-Loc -Section "Diagnostics" -Key "ParametersHeader" -Fallback "  Parameters:") -ForegroundColor Gray
             foreach ($key in $Config.AgentService.Parameters.Keys) {
                 Write-Host ("    -{0} : {1}" -f $key, $Config.AgentService.Parameters[$key]) -ForegroundColor Gray
             }
         }
     } else {
-        Write-Host "Agent service not found." -ForegroundColor Red
+        Write-Host (Get-Loc -Section "Diagnostics" -Key "AgentNotFound" -Fallback "Agent service not found.") -ForegroundColor Red
     }
 
     Write-Host ""
-    Write-Host "CLUSTERS:" -ForegroundColor Green
+    Write-Host (Get-Loc -Section "Diagnostics" -Key "ClustersHeader" -Fallback "CLUSTERS:") -ForegroundColor Green
     if ($Config.ClusterNodes.Count -gt 0) {
         foreach ($node in $Config.ClusterNodes) {
             Write-Host ("  Node: {0} (port: {1})" -f $node.NodeName, $node.AgentPort) -ForegroundColor Gray
             Write-Host ("    Reg file: {0}" -f $node.RegFile) -ForegroundColor DarkGray
         }
     } else {
-        Write-Host "  Cluster information not found." -ForegroundColor DarkGray
+        Write-Host (Get-Loc -Section "Diagnostics" -Key "ClusterNotFound" -Fallback "  Cluster information not found.") -ForegroundColor DarkGray
     }
 
     Write-Host ""
-    Write-Host "SAFETY:" -ForegroundColor Green
+    Write-Host (Get-Loc -Section "Diagnostics" -Key "SafetyHeader" -Fallback "SAFETY:") -ForegroundColor Green
     $Safe = Test-Safety
-    $statusText = if ($Safe) { "NO active 1C processes" } else { "ACTIVE 1C processes detected" }
+    $ActiveNone = Get-Loc -Section "Diagnostics" -Key "ActiveNone" -Fallback "NO active 1C processes"
+    $ActiveDetected = Get-Loc -Section "Diagnostics" -Key "ActiveDetected" -Fallback "ACTIVE 1C processes detected"
+    $statusText = if ($Safe) { $ActiveNone } else { $ActiveDetected }
     Write-Host ("  Active sessions: {0}" -f $statusText) -ForegroundColor (if ($Safe) { "Green" } else { "Red" })
 
     Write-Host ""
-    Write-Host "RECOMMENDED COMMAND:" -ForegroundColor Cyan
+    Write-Host (Get-Loc -Section "Diagnostics" -Key "RecommendedCmdHeader" -Fallback "RECOMMENDED COMMAND:") -ForegroundColor Cyan
     $Cmd = ".\Clear-1CServerCache.ps1"
     if ($Config.SrvInfoPath) { $Cmd += " -SrvInfoPath `"$($Config.SrvInfoPath)`"" }
     if ($Script:LanguageEffective -eq "ru-RU") { $Cmd += " -Language ru-RU" }
     Write-Host ("  {0}" -f $Cmd) -ForegroundColor Yellow
 }
 
-# ============================================
-# MAIN ENTRY POINT
-# ============================================
+# =========================
+# MAIN
+# =========================
 
 function Main {
-    # Require admin privileges
     Test-Admin
-
-    # Load settings and localization
     Load-1CSettings
 
     if ($Diagnostic) {
@@ -666,20 +606,13 @@ function Main {
         return
     }
 
-    # Initialize logging
     $LogFile = Initialize-Logging -Config $Script:Config
 
-    # Start message
-    if ($Script:Localization -and $Script:Localization.Messages.ScriptStarted) {
-        Write-Log -Message ($Script:Localization.Messages.ScriptStarted -f $Script:Config.version) -Level "INFO" -LogFile $LogFile
-    } else {
-        Write-Log -Message "1C Server Cache Cleaner started (version $($Script:Config.version))." -Level "INFO" -LogFile $LogFile
-    }
+    $scriptStarted = Get-Loc -Section "Messages" -Key "ScriptStarted" -Fallback "1C Server Cache Cleaner started (version {0})."
+    Write-Log -Message ($scriptStarted -f $Script:Config.version) -Level "INFO" -LogFile $LogFile
 
-    # Discover 1C configuration
     $Config = Get-1CFullConfiguration
 
-    # Determine SrvInfoPath
     $TargetPath = if ($SrvInfoPath) {
         $SrvInfoPath
     } elseif ($Config.SrvInfoPath) {
@@ -691,20 +624,22 @@ function Main {
     }
 
     if (-not $TargetPath) {
-        Write-Log -Message "SrvInfoPath could not be determined. Specify -SrvInfoPath or configure it in settings.json." -Level "ERROR" -LogFile $LogFile
+        $m = Get-Loc -Section "Messages" -Key "SrvInfoNotDetermined" -Fallback "SrvInfoPath could not be determined. Specify -SrvInfoPath or configure it in settings.json."
+        Write-Log -Message $m -Level "ERROR" -LogFile $LogFile
         return
     }
 
-    # Basic path sanity check: require directory path containing "srvinfo"
     if ($TargetPath -notmatch '\\srvinfo(\\|$)') {
-        Write-Log -Message "SrvInfoPath looks unusual: $TargetPath" -Level "WARNING" -LogFile $LogFile
+        $m = Get-Loc -Section "Messages" -Key "SrvInfoPathUnusual" -Fallback ("SrvInfoPath looks unusual: {0}" -f $TargetPath)
+        Write-Log -Message $m -Level "WARNING" -LogFile $LogFile
+
         if (-not $Force) {
-            Write-Log -Message "Use -Force to work with non-standard SrvInfoPath." -Level "ERROR" -LogFile $LogFile
+            $m2 = Get-Loc -Section "Messages" -Key "SrvInfoPathUnusualNeedForce" -Fallback "Use -Force to work with non-standard SrvInfoPath."
+            Write-Log -Message $m2 -Level "ERROR" -LogFile $LogFile
             return
         }
     }
 
-    # Effective service stop timeout
     $EffectiveTimeout = if ($PSBoundParameters.ContainsKey("ServiceStopTimeout")) {
         $ServiceStopTimeout
     } elseif ($Script:Config.defaults.serviceStopTimeout) {
@@ -713,100 +648,78 @@ function Main {
         120
     }
 
-    # Service display names (from settings.json or localization)
-    $ServiceDisplayAgent  = $null
+    $ServiceDisplayAgent = $null
     $ServiceDisplayServer = $null
 
     if ($Script:Config.serviceNames) {
-        $ServiceDisplayAgent  = $Script:Config.serviceNames.agent[$Script:LanguageEffective]
+        $ServiceDisplayAgent = $Script:Config.serviceNames.agent[$Script:LanguageEffective]
         $ServiceDisplayServer = $Script:Config.serviceNames.server[$Script:LanguageEffective]
     }
 
-    if (-not $ServiceDisplayAgent -and $Script:Localization.ServiceNames.Agent) {
-        $ServiceDisplayAgent = $Script:Localization.ServiceNames.Agent
+    if (-not $ServiceDisplayAgent) {
+        $ServiceDisplayAgent = Get-Loc -Section "ServiceNames" -Key "Agent" -Fallback $null
     }
-    if (-not $ServiceDisplayServer -and $Script:Localization.ServiceNames.Server) {
-        $ServiceDisplayServer = $Script:Localization.ServiceNames.Server
+    if (-not $ServiceDisplayServer) {
+        $ServiceDisplayServer = Get-Loc -Section "ServiceNames" -Key "Server" -Fallback $null
     }
 
     $ServicesToManage = @()
-    if ($ServiceDisplayAgent)  { $ServicesToManage += $ServiceDisplayAgent }
+    if ($ServiceDisplayAgent) { $ServicesToManage += $ServiceDisplayAgent }
     if ($ServiceDisplayServer) { $ServicesToManage += $ServiceDisplayServer }
 
-    # Confirmation before cleanup if required by config
     if ($Script:Config.safety.requireConfirmation -and -not $Force) {
-        $prompt = if ($Script:Localization.Prompts.ConfirmCleanup) {
-            $Script:Localization.Prompts.ConfirmCleanup
-        } else {
-            "Proceed with cache cleanup? [Y/N]: "
-        }
-
+        $prompt = Get-Loc -Section "Prompts" -Key "ConfirmCleanup" -Fallback "Proceed with cache cleanup? [Y/N]: "
         $answer = Read-Host $prompt
         if ($answer -notin @("Y", "y", "Yes", "YES")) {
-            Write-Log -Message "Cache cleanup cancelled by user before start." -Level "WARNING" -LogFile $LogFile
+            $m = Get-Loc -Section "Messages" -Key "Completion" -Fallback "Operation cancelled."
+            Write-Log -Message $m -Level "WARNING" -LogFile $LogFile
             return
         }
     }
 
-    # Safety checks (active sessions etc.)
     if (-not (Test-Safety -Force:$Force -LogFile $LogFile)) {
-        $failMsg = if ($Script:Localization.Messages.SafetyCheckFailed) {
-            $Script:Localization.Messages.SafetyCheckFailed
-        } else {
-            "Safety check failed: active 1C processes or sessions detected."
-        }
-        Write-Log -Message $failMsg -Level "ERROR" -LogFile $LogFile
-        Write-Host ""
-        Write-Host $failMsg -ForegroundColor Red
+        $m = Get-Loc -Section "Messages" -Key "SafetyCheckFailed" -Fallback "Safety check failed."
+        Write-Log -Message $m -Level "ERROR" -LogFile $LogFile
+        Write-Host $m -ForegroundColor Red
         return
     }
 
-    # Stop services if needed
     $StoppedServices = @()
     if (-not $NoServiceRestart -and $ServicesToManage.Count -gt 0) {
-        Write-Log -Message "Stopping 1C services..." -Level "INFO" -LogFile $LogFile
+        Write-Log -Message (Get-Loc -Section "Messages" -Key "ServicesStopping" -Fallback "Stopping 1C services...") -Level "INFO" -LogFile $LogFile
         $StoppedServices = Stop-1CServices -ServiceNames $ServicesToManage -Timeout $EffectiveTimeout -LogFile $LogFile -WhatIf:$WhatIf
     } else {
-        Write-Log -Message "Service stop is skipped (NoServiceRestart is set or no services defined)." -Level "INFO" -LogFile $LogFile
+        Write-Log -Message (Get-Loc -Section "Messages" -Key "ServicesStopping" -Fallback "Service stop is skipped.") -Level "INFO" -LogFile $LogFile
     }
 
-    # Cache cleanup
     Clear-1CCache -SrvInfoPath $TargetPath -LogFile $LogFile -WhatIf:$WhatIf
 
-    # Start services if they were stopped
     if (-not $NoServiceRestart -and $StoppedServices.Count -gt 0) {
-        Write-Log -Message "Starting 1C services..." -Level "INFO" -LogFile $LogFile
+        Write-Log -Message (Get-Loc -Section "Messages" -Key "ServicesStarting" -Fallback "Starting 1C services...") -Level "INFO" -LogFile $LogFile
         Start-1CServices -ServiceNames $StoppedServices -LogFile $LogFile -WhatIf:$WhatIf
     }
 
-    # Completion message
-    $completeMsg = if ($Script:Localization.Messages.Completion) {
-        $Script:Localization.Messages.Completion
-    } else {
-        "Cache cleanup completed successfully."
-    }
-
+    $completeMsg = Get-Loc -Section "Messages" -Key "Completion" -Fallback "Cache cleanup completed successfully."
     Write-Log -Message $completeMsg -Level "SUCCESS" -LogFile $LogFile
-    Write-Host ""
+
     Write-Host $completeMsg -ForegroundColor Green
-    Write-Host ("Log file: {0}" -f $LogFile) -ForegroundColor Gray
+    Write-Host ((Get-Loc -Section "Messages" -Key "LogFilePath" -Fallback "Log file: {0}") -f $LogFile) -ForegroundColor Gray
 
     if ($WhatIf) {
-        Write-Host ""
-        Write-Host "This was a dry run (WhatIf mode)." -ForegroundColor Yellow
-        Write-Host "Run without -WhatIf to perform actual cleanup." -ForegroundColor Yellow
+        Write-Host (Get-Loc -Section "Messages" -Key "DryRunNotice1" -Fallback "This was a dry run (WhatIf mode).") -ForegroundColor Yellow
+        Write-Host (Get-Loc -Section "Messages" -Key "DryRunNotice2" -Fallback "Run without -WhatIf to perform actual cleanup.") -ForegroundColor Yellow
     }
 }
 
-# ============================================
+# =========================
 # SCRIPT START
-# ============================================
+# =========================
 
 try {
     Main
 } catch {
-    Write-Host ""
-    Write-Host ("ERROR: {0}" -f $_.Exception.Message) -ForegroundColor Red
-    Write-Host "Hint: use -Diagnostic for diagnostics or -WhatIf for a dry run." -ForegroundColor Yellow
+    $err = ("ERROR: {0}" -f $_.Exception.Message)
+    Write-Host $err -ForegroundColor Red
+    Write-Host (Get-Loc -Section "Messages" -Key "HintDiagnosticWhatIf" -Fallback "Hint: use -Diagnostic for diagnostics or -WhatIf for a dry run.") -ForegroundColor Yellow
     exit 1
 }
