@@ -8,6 +8,7 @@
     - Registry is the single source of truth
     - Stop Server + Agent -> clean cache -> start Agent + Server
     - ASCII-only script body
+    - Author @sbezpalov ( https://github.com/sbezpalov/public/blob/main/1c/1CClearCache/ )
 
 .VERSION
     3.1.5
