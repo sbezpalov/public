@@ -1,11 +1,9 @@
 {
-    "version": "3.0.0",
-    "author": "1C Server Automation Community",
+    "version": "3.1.7",
     
     "defaults": {
         "serviceStopTimeout": 120,
-        "language": "auto",
-        "logRetentionDays": 30
+        "language": "auto"
     },
     
     "paths": {
@@ -14,25 +12,16 @@
     },
     
     "safety": {
-        "checkActiveSessions": true,
-        "requireConfirmation": false,
-        "enableBackup": false
+        "checkActiveSessions": true
     },
     
-    "serviceNames": {
-        "agent": {
-            "en-US": "1C:Enterprise 8.3 Server Agent",
-            "ru-RU": "Агент сервера 1С:Предприятие 8.3"
-        },
-        "server": {
-            "en-US": "1C:Enterprise 8.3 Server",
-            "ru-RU": "Сервер 1С:Предприятие 8.3"
-        }
+    "tempCleanup": {
+        "enabled": true,
+        "olderThanDays": 7,
+        "includeSystemProfiles": false
     },
     
     "logging": {
-        "level": "INFO",
-        "maxFileSizeMB": 10,
-        "enableEventLog": true
+        "level": "INFO"
     }
 }
